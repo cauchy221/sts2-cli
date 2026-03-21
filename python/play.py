@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""
+sts2-cli interactive player — play Slay the Spire 2 in your terminal.
+
+Usage:
+    python3 play.py                    # Interactive mode (you play)
+    python3 play.py --auto             # Auto-play with simple AI
+    python3 play.py --seed myseed      # Fixed seed for reproducibility
+    python3 play.py --character Silent  # Choose character
+"""
+
+import json
+import subprocess
+import sys
+import os
+import argparse
+import random
+
+DOTNET = os.path.expanduser("~/.dotnet-arm64/dotnet")
+PROJECT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "Sts2Headless", "Sts2Headless.csproj")
+
+# ─── Display helpers ───
+
+def n(obj):
+    """Extract bilingual display name."""
+    if isinstance(obj, dict):
+        if "en" in obj:
+            zh = obj.get("zh")
+            if zh and zh != obj["en"]:
+                return f"{obj['en']}({zh})"
+            return obj["en"]
+    return str(obj)
+
+def short_n(obj):
+    """Short English name only."""
+    if isinstance(obj, dict) and "en" in obj:
+        return obj["en"]
+    return str(obj)
+
+def desc(obj):
+    """Extract description, strip BBCode tags."""
+    if isinstance(obj, dict) and "en" in obj:
+        import re
+        text = obj.get("zh") or obj.get("en") or ""
+        text = re.sub(r'\[/?[^\]]+\]', '', text)  # strip [tags]
+        text = re.sub(r'\{[^}]+\}', '?', text)    # replace {vars} with ?
+        return text
+    return ""
+
+COLORS = {
+    "red": "\033[91m", "green": "\033[92m", "yellow": "\033[93m",
+    "blue": "\033[94m", "magenta": "\033[95m", "cyan": "\033[96m",
+    "bold": "\033[1m", "dim": "\033[2m", "reset": "\033[0m",
+}
+
+def c(text, color):
+    return f"{COLORS.get(color, '')}{text}{COLORS['reset']}"
+
+def bar(current, maximum, width=20):
+    filled = int(current / max(maximum, 1) * width)
+    return c("█" * filled, "red") + c("░" * (width - filled), "dim")
+
+# ─── Game display ───
+
+def show_player(p):
+    hp, mhp = p.get("hp", 0), p.get("max_hp", 1)
+    blk = p.get("block", 0)
+    gold = p.get("gold", 0)
+    deck = p.get("deck_size", 0)
+    name = n(p.get("name", "?"))
+    relics = ", ".join(n(r) for r in p.get("relics", []))
+    potions = ", ".join(n(r) for r in p.get("potions", []))
+
+    print(f"  {c(name, 'bold')}  HP {bar(hp, mhp)} {c(f'{hp}/{mhp}', 'red')}"
+          + (f"  Block {c(str(blk), 'blue')}" if blk > 0 else "")
+          + f"  Gold {c(str(gold), 'yellow')}  Deck {deck}")
+    if relics:
+        print(f"  Relics: {c(relics, 'dim')}")
+    if potions:
+        print(f"  Potions: {c(potions, 'magenta')}")
+
+def show_combat(state):
+    rnd = state.get("round", 0)
+    energy = state.get("energy", 0)
+    max_energy = state.get("max_energy", 0)
+    draw = state.get("draw_pile_count", 0)
+    discard = state.get("discard_pile_count", 0)
+
+    print(f"\n{'─' * 60}")
+    print(f"  {c(f'Round {rnd}', 'bold')}  Energy {c(f'{energy}/{max_energy}', 'cyan')}  Draw {draw}  Discard {discard}")
+    show_player(state.get("player", {}))
+
+    print()
+    for e in state.get("enemies", []):
+        hp, mhp = e.get("hp", 0), e.get("max_hp", 1)
+        blk = e.get("block", 0)
+        intent = c("⚔ ATK", "red") if e.get("intends_attack") else c("? ???", "dim")
+        print(f"  [{e['index']}] {n(e['name'])}  {bar(hp, mhp)} {hp}/{mhp}"
+              + (f"  Block {c(str(blk), 'blue')}" if blk else "")
+              + f"  {intent}")
+
+    print()
+    hand = state.get("hand", [])
+    for card in hand:
+        cost = card.get("cost", 0)
+        playable = card.get("can_play", False)
+        ctype = card.get("type", "?")
+        target = card.get("target_type", "")
+
+        type_color = {"Attack": "red", "Skill": "blue", "Power": "magenta", "Status": "dim", "Curse": "dim"}.get(ctype, "reset")
+        mark = c("●", "green") if playable else c("○", "dim")
+        cost_str = c(str(cost), "cyan")
+        card_desc = desc(card.get("description", {}))
+
+        print(f"  {mark} [{card['index']}] {c(n(card['name']), type_color)} ({cost_str}) {c(ctype, 'dim')}"
+              + (f"  → {target}" if target == "AnyEnemy" else "")
+              + (f"  {c(card_desc, 'dim')}" if card_desc else ""))
+
+def show_map(state):
+    act_name = n(state.get("act_name", "?"))
+    floor = state.get("floor", "?")
+    print(f"\n{'═' * 60}")
+    print(f"  {c(f'{act_name}', 'bold')} Floor {floor}")
+    show_player(state.get("player", {}))
+    print()
+
+    type_icons = {
+        "Monster": "⚔", "Elite": "💀", "Boss": "👹",
+        "RestSite": "🏕", "Shop": "🏪", "Treasure": "💎",
+        "Event": "❓", "Unknown": "❓", "Ancient": "🏛",
+    }
+
+    for ch in state.get("choices", []):
+        icon = type_icons.get(ch["type"], "?")
+        print(f"  [{ch['col']},{ch['row']}] {icon} {ch['type']}")
+
+def show_card_reward(state):
+    print(f"\n{'─' * 60}")
+    print(f"  {c('Card Reward', 'bold')} — choose one (or skip)")
+    show_player(state.get("player", {}))
+    print()
+    for card in state.get("cards", []):
+        ctype = card.get("type", "?")
+        rarity = card.get("rarity", "Common")
+        type_color = {"Attack": "red", "Skill": "blue", "Power": "magenta"}.get(ctype, "reset")
+        rarity_color = {"Rare": "yellow", "Uncommon": "cyan"}.get(rarity, "dim")
+        card_desc = desc(card.get("description", {}))
+        print(f"  [{card['index']}] {c(n(card['name']), type_color)} {c(rarity, rarity_color)} {c(ctype, 'dim')}")
+        if card_desc:
+            print(f"      {c(card_desc, 'dim')}")
+
+def show_shop(state):
+    print(f"\n{'─' * 60}")
+    print(f"  {c('Shop', 'bold')}")
+    show_player(state.get("player", {}))
+    gold = state.get("player", {}).get("gold", 0)
+
+    print(f"\n  {c('Cards:', 'bold')}")
+    for card in state.get("cards", []):
+        if not card.get("is_stocked"): continue
+        cost = card.get("cost", 0)
+        affordable = c(str(cost), "green") if cost <= gold else c(str(cost), "red")
+        sale = c(" SALE", "yellow") if card.get("on_sale") else ""
+        print(f"  [{card['index']}] {n(card['name'])} ({card.get('type','?')}) — {affordable}g{sale}")
+
+    print(f"\n  {c('Relics:', 'bold')}")
+    for r in state.get("relics", []):
+        if not r.get("is_stocked"): continue
+        cost = r.get("cost", 0)
+        affordable = c(str(cost), "green") if cost <= gold else c(str(cost), "red")
+        print(f"  [r{r['index']}] {n(r['name'])} — {affordable}g")
+
+    print(f"\n  {c('Potions:', 'bold')}")
+    for p in state.get("potions", []):
+        if not p.get("is_stocked"): continue
+        cost = p.get("cost", 0)
+        affordable = c(str(cost), "green") if cost <= gold else c(str(cost), "red")
+        print(f"  [p{p['index']}] {n(p['name'])} — {affordable}g")
+
+    removal_cost = state.get("card_removal_cost")
+    if removal_cost:
+        affordable = c(str(removal_cost), "green") if removal_cost <= gold else c(str(removal_cost), "red")
+        print(f"\n  [rm] Remove a card — {affordable}g")
+
+    print(f"\n  [leave] Leave shop")
+
+def show_rest_site(state):
+    print(f"\n{'─' * 60}")
+    print(f"  {c('Rest Site', 'bold')}")
+    show_player(state.get("player", {}))
+    print()
+    for opt in state.get("options", []):
+        enabled = opt.get("is_enabled", True)
+        mark = c("●", "green") if enabled else c("○", "dim")
+        print(f"  {mark} [{opt['index']}] {opt.get('option_id', '?')} — {opt.get('name', '?')}")
+
+def show_event(state):
+    print(f"\n{'─' * 60}")
+    event_name = state.get("event_name", "?")
+    event_desc = state.get("description", "")
+    print(f"  {c(f'Event: {event_name}', 'bold')}")
+    if event_desc:
+        print(f"  {c(event_desc, 'dim')}")
+    show_player(state.get("player", {}))
+    print()
+    for opt in state.get("options", []):
+        locked = opt.get("is_locked", False)
+        mark = c("○", "dim") if locked else c("●", "green")
+        title = opt.get("title", opt.get("text_key", f"Option {opt['index']}"))
+        print(f"  {mark} [{opt['index']}] {title}")
+
+# ─── Input handling ───
+
+def get_input(prompt, valid_options=None):
+    """Get user input with validation."""
+    while True:
+        try:
+            raw = input(f"\n{c('>', 'green')} {prompt}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nQuitting...")
+            sys.exit(0)
+
+        if not raw:
+            continue
+        if valid_options and raw not in valid_options:
+            print(f"  Invalid. Options: {', '.join(valid_options)}")
+            continue
+        return raw
+
+# ─── Main game loop ───
+
+def play(character="Ironclad", seed=None, auto=False):
+    proc = subprocess.Popen(
+        [DOTNET, "run", "--no-build", "--project", PROJECT],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, bufsize=1,
+    )
+
+    def read():
+        while True:
+            l = proc.stdout.readline().strip()
+            if not l:
+                return None
+            if l.startswith("{"):
+                return json.loads(l)
+
+    def send(cmd):
+        proc.stdin.write(json.dumps(cmd) + "\n")
+        proc.stdin.flush()
+        return read()
+
+    try:
+        ready = read()
+        if not ready:
+            print("Failed to start simulator")
+            return
+
+        print(f"\n{c('Slay the Spire 2 — Headless CLI', 'bold')}")
+        print(f"Character: {character}  Seed: {seed or 'random'}")
+        print(f"Type {c('help', 'cyan')} at any prompt for available commands.\n")
+
+        state = send({"cmd": "start_run", "character": character, "seed": seed or f"cli_{random.randint(1000,9999)}"})
+
+        while True:
+            if not state:
+                print("Connection lost.")
+                break
+
+            if state.get("type") == "error":
+                print(f"  {c('Error:', 'red')} {state.get('message', '?')}")
+                state = send({"cmd": "action", "action": "proceed"})
+                continue
+
+            dec = state.get("decision", "")
+
+            if dec == "game_over":
+                victory = state.get("victory", False)
+                p = state.get("player", {})
+                print(f"\n{'═' * 60}")
+                if victory:
+                    print(f"  {c('VICTORY!', 'green')}")
+                else:
+                    print(f"  {c('DEFEAT', 'red')} at Act {state.get('act')}, Floor {state.get('floor')}")
+                show_player(p)
+                print(f"{'═' * 60}")
+                break
+
+            elif dec == "map_select":
+                show_map(state)
+                choices = state.get("choices", [])
+                valid = {f"{ch['col']},{ch['row']}": ch for ch in choices}
+
+                if auto:
+                    # Auto: prefer rest if low HP, else first choice
+                    p = state.get("player", {})
+                    hp_ratio = p.get("hp", 1) / max(p.get("max_hp", 1), 1)
+                    if hp_ratio < 0.4:
+                        pick = next((ch for ch in choices if ch["type"] == "RestSite"), choices[0])
+                    else:
+                        pick = choices[0]
+                    key = f"{pick['col']},{pick['row']}"
+                else:
+                    key = get_input("Choose node (col,row)", set(valid.keys()))
+
+                pick = valid[key]
+                state = send({"cmd": "action", "action": "select_map_node",
+                             "args": {"col": pick["col"], "row": pick["row"]}})
+
+            elif dec == "combat_play":
+                show_combat(state)
+                hand = state.get("hand", [])
+                enemies = state.get("enemies", [])
+                energy = state.get("energy", 0)
+
+                valid = {"e": "end_turn"}
+                for card in hand:
+                    if card.get("can_play") and card.get("cost", 99) <= energy:
+                        valid[str(card["index"])] = card
+
+                if auto:
+                    # Auto: play first playable card, or end turn
+                    playable = [c for c in hand if c.get("can_play") and c.get("cost", 99) <= energy]
+                    if playable:
+                        card = playable[0]
+                        choice = str(card["index"])
+                    else:
+                        choice = "e"
+                else:
+                    choice = get_input("Play card [index] or (e)nd turn", set(valid.keys()) | {"help"})
+                    if choice == "help":
+                        print("  Enter card index to play, or 'e' to end turn.")
+                        continue
+
+                if choice == "e":
+                    state = send({"cmd": "action", "action": "end_turn"})
+                else:
+                    card = valid[choice]
+                    args = {"card_index": card["index"]}
+                    if card.get("target_type") == "AnyEnemy":
+                        if len(enemies) == 1:
+                            args["target_index"] = enemies[0]["index"]
+                        elif auto:
+                            args["target_index"] = min(enemies, key=lambda e: e.get("hp", 999))["index"]
+                        else:
+                            tgt = get_input("Target enemy [index]",
+                                           {str(e["index"]) for e in enemies})
+                            args["target_index"] = int(tgt)
+                    state = send({"cmd": "action", "action": "play_card", "args": args})
+
+            elif dec == "card_reward":
+                show_card_reward(state)
+                cards = state.get("cards", [])
+                valid = {str(c["index"]): c for c in cards}
+                valid["s"] = None  # skip
+
+                if auto:
+                    choice = "0" if cards else "s"
+                else:
+                    choice = get_input("Pick card [index] or (s)kip", set(valid.keys()))
+
+                if choice == "s":
+                    state = send({"cmd": "action", "action": "skip_card_reward"})
+                else:
+                    state = send({"cmd": "action", "action": "select_card_reward",
+                                 "args": {"card_index": int(choice)}})
+
+            elif dec == "shop":
+                show_shop(state)
+
+                if auto:
+                    choice = "leave"
+                else:
+                    choice = get_input("Buy [index/r0/p0/rm] or (leave)")
+
+                if choice == "leave":
+                    state = send({"cmd": "action", "action": "leave_room"})
+                elif choice == "rm":
+                    state = send({"cmd": "action", "action": "remove_card"})
+                elif choice.startswith("r"):
+                    state = send({"cmd": "action", "action": "buy_relic",
+                                 "args": {"relic_index": int(choice[1:])}})
+                elif choice.startswith("p"):
+                    state = send({"cmd": "action", "action": "buy_potion",
+                                 "args": {"potion_index": int(choice[1:])}})
+                else:
+                    state = send({"cmd": "action", "action": "buy_card",
+                                 "args": {"card_index": int(choice)}})
+
+            elif dec == "rest_site":
+                show_rest_site(state)
+                options = state.get("options", [])
+                enabled = [o for o in options if o.get("is_enabled")]
+                valid = {str(o["index"]): o for o in enabled}
+
+                if auto:
+                    hp = state.get("player", {}).get("hp", 1)
+                    mhp = state.get("player", {}).get("max_hp", 1)
+                    heal = next((o for o in enabled if o.get("option_id") == "HEAL"), None)
+                    smith = next((o for o in enabled if o.get("option_id") == "SMITH"), None)
+                    pick = (heal if hp < mhp * 0.7 else smith) or (heal or (enabled[0] if enabled else None))
+                    choice = str(pick["index"]) if pick else "0"
+                else:
+                    choice = get_input("Choose option [index]", set(valid.keys()))
+
+                state = send({"cmd": "action", "action": "choose_option",
+                             "args": {"option_index": int(choice)}})
+                if state and state.get("type") == "error":
+                    state = send({"cmd": "action", "action": "leave_room"})
+
+            elif dec == "event_choice":
+                show_event(state)
+                options = state.get("options", [])
+                unlocked = [o for o in options if not o.get("is_locked")]
+                valid = {str(o["index"]): o for o in unlocked}
+                valid["leave"] = None
+
+                if auto:
+                    choice = str(unlocked[0]["index"]) if unlocked else "leave"
+                else:
+                    choice = get_input("Choose option [index] or (leave)", set(valid.keys()))
+
+                if choice == "leave":
+                    state = send({"cmd": "action", "action": "leave_room"})
+                else:
+                    state = send({"cmd": "action", "action": "choose_option",
+                                 "args": {"option_index": int(choice)}})
+                    if state and state.get("type") == "error":
+                        state = send({"cmd": "action", "action": "leave_room"})
+
+            else:
+                print(f"  Unknown state: {dec}")
+                state = send({"cmd": "action", "action": "proceed"})
+
+    finally:
+        try:
+            proc.stdin.write(json.dumps({"cmd": "quit"}) + "\n")
+            proc.stdin.flush()
+        except:
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except:
+            proc.kill()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Play Slay the Spire 2 in your terminal")
+    parser.add_argument("--auto", action="store_true", help="Auto-play with simple AI")
+    parser.add_argument("--seed", type=str, default=None, help="Random seed")
+    parser.add_argument("--character", type=str, default="Ironclad",
+                       choices=["Ironclad", "Silent", "Defect", "Regent"],
+                       help="Character to play")
+    args = parser.parse_args()
+
+    play(character=args.character, seed=args.seed, auto=args.auto)
