@@ -476,143 +476,106 @@ def show_event(state):
 # ─── Input handling ───
 
 def _render_map(map_data, choice_set=None):
-    """Render a full ASCII map with paths using a fixed-width character buffer."""
+    """Render map as a clean grid — no connection lines, just colored nodes."""
     if choice_set is None:
         choice_set = set()
 
     ctx = map_data.get("context", {})
     act = n(ctx.get("act_name", "?"))
-    floor = ctx.get("floor", "?")
+    floor_n = ctx.get("floor", "?")
     cur = map_data.get("current_coord")
 
-    # Single-width ASCII icons (avoids emoji alignment issues)
     ICONS = {
         "Monster": "M", "Elite": "E", "Boss": "B",
         "RestSite": "R", "Shop": "$", "Treasure": "T",
         "Event": "?", "Unknown": "?", "Ancient": "A",
-        "Unassigned": ".",
     }
 
     rows = map_data.get("rows", [])
     if not rows:
-        print(f"  {t('No map data','无地图数据')}")
         return
 
-    # Build data structures
-    node_map = {}  # (col, row) → node
-    edge_list = []  # (from_col, from_row, to_col, to_row)
+    # Collect nodes
+    node_map = {}
     max_col = 0
-    row_numbers = []
-
+    row_numbers = set()
     for row in rows:
         for nd in row:
             col, rn = nd.get("col", 0), nd.get("row", 0)
             node_map[(col, rn)] = nd
             max_col = max(max_col, col)
-            if rn not in row_numbers:
-                row_numbers.append(rn)
-            for ch in (nd.get("children") or []):
-                edge_list.append((col, rn, ch["col"], ch["row"]))
+            row_numbers.add(rn)
 
-    row_numbers.sort()
+    row_numbers = sorted(row_numbers)
     total_cols = max_col + 1
-    CW = 5  # character width per column
+    W = 4  # chars per column cell
 
-    print(f"\n{'═' * (CW * total_cols + 8)}")
-    print(f"  {c(act, 'bold')} — Floor {floor}")
-    print()
+    # Header
+    width = W * total_cols + 6
+    print(f"\n{'═' * width}")
+    print(f"  {c(act, 'bold')} — Floor {floor_n}")
 
-    # Boss line
+    # Column headers
+    hdr = "".join(f"{i:^{W}}" for i in range(total_cols))
+    print(f"  {c(f'    {hdr}', 'dim')}")
+    print(f"  {'─' * width}")
+
+    # Boss row
     boss = map_data.get("boss", {})
-    boss_col = boss.get("col", total_cols // 2)
-    boss_row = boss.get("row", -1)
-    buf = [" "] * (CW * total_cols)
-    pos = boss_col * CW + CW // 2 - 1
-    # Place "B" at boss position
-    if 0 <= pos < len(buf):
-        buf[pos] = " "
-        buf[pos + 1] = "B" if pos + 1 < len(buf) else "B"
-    node_line = "".join(buf)
-    # Color the B
-    node_line = node_line[:pos] + c("[B]", "red") + node_line[pos+3:] if pos + 3 <= len(buf) else node_line
-    print(f"    {node_line}  BOSS")
-
-    # Render rows from top to bottom (highest row first)
-    for ri in range(len(row_numbers) - 1, -1, -1):
-        rn = row_numbers[ri]
-
-        # --- Connection line: edges FROM this row TO the row above ---
-        if ri < len(row_numbers) - 1:
-            above_rn = row_numbers[ri + 1]
-            buf = [" "] * (CW * total_cols)
-            for fc, fr, tc, tr in edge_list:
-                if fc == tc and fr == rn and tr == above_rn:
-                    # Straight up: |
-                    pos = fc * CW + CW // 2
-                    if 0 <= pos < len(buf): buf[pos] = "|"
-                elif fr == rn and tr == above_rn:
-                    fp = fc * CW + CW // 2
-                    tp = tc * CW + CW // 2
-                    if fp < tp:
-                        # Going right: /
-                        if 0 <= fp < len(buf): buf[fp] = "/"
-                        if 0 <= tp < len(buf): buf[tp] = "/"
-                    else:
-                        # Going left: \
-                        if 0 <= tp < len(buf): buf[tp] = "\\"
-                        if 0 <= fp < len(buf): buf[fp] = "\\"
-            print(f"    {''.join(buf)}")
+    boss_col = boss.get("col", 0)
+    cells = [f"{'':^{W}}"] * total_cols
+    cells[boss_col] = f"{c('B', 'red'):^{W + 9}}"  # +9 for ANSI codes
+    # Manual: build line char by char for boss
+    boss_line = ""
+    for i in range(total_cols):
+        if i == boss_col:
+            boss_line += c(" B  ", "red")
         else:
-            # Top row: connections to boss
-            buf = [" "] * (CW * total_cols)
-            for fc, fr, tc, tr in edge_list:
-                if fr == rn and tr == boss_row:
-                    pos = fc * CW + CW // 2
-                    if 0 <= pos < len(buf): buf[pos] = "|"
-            print(f"    {''.join(buf)}")
+            boss_line += " " * W
+    print(f"  {c('B','dim')} | {boss_line}")
+    print(f"  {'─' * width}")
 
-        # --- Node line ---
-        buf = [" "] * (CW * total_cols)
-        color_inserts = []  # (pos, plain_char, colored_str)
-
+    # Map rows (top to bottom)
+    for rn in reversed(row_numbers):
+        line_parts = []
         for col in range(total_cols):
             nd = node_map.get((col, rn))
             if not nd:
+                line_parts.append(" " * W)
                 continue
-            icon = ICONS.get(nd.get("type", "?"), "?")
+
+            icon = ICONS.get(nd.get("type", "?"), "·")
             is_cur = (cur and cur["col"] == col and cur["row"] == rn)
             is_choice = (col, rn) in choice_set
             visited = nd.get("visited", False)
 
-            pos = col * CW + CW // 2
-            if 0 <= pos < len(buf):
-                buf[pos] = icon
-                if is_cur:
-                    color_inserts.append((pos, icon, c(f">{icon}", "green")))
-                elif is_choice:
-                    color_inserts.append((pos, icon, c(icon, "yellow")))
-                elif visited:
-                    color_inserts.append((pos, icon, c(icon, "dim")))
+            if is_cur:
+                # Green, bracketed: [M]
+                cell = c(f"[{icon}]", "green")
+                # Pad: cell is 3 visible chars, need W
+                pad = W - 3
+                cell = " " * (pad // 2) + cell + " " * (pad - pad // 2)
+            elif is_choice:
+                cell = c(f" {icon} ", "yellow")
+                pad = W - 3
+                cell = " " * (pad // 2) + cell + " " * (pad - pad // 2)
+            elif visited:
+                cell = c(f" {icon} ", "dim")
+                pad = W - 3
+                cell = " " * (pad // 2) + cell + " " * (pad - pad // 2)
+            else:
+                cell = f" {icon} "
+                pad = W - 3
+                cell = " " * (pad // 2) + cell + " " * (pad - pad // 2)
 
-        line = "".join(buf)
-        # Apply colors (process from right to left to preserve positions)
-        for pos, plain, colored in sorted(color_inserts, key=lambda x: -x[0]):
-            line = line[:pos] + colored + line[pos + len(plain):]
+            line_parts.append(cell)
 
-        print(f"  {rn:>2}| {line}")
+        print(f"  {rn:>2}| {''.join(line_parts)}")
 
+    print(f"  {'─' * width}")
     # Legend
-    legend_items = [
-        f"{c('M','red')}={t('Monster','怪物')}",
-        f"{c('E','red')}={t('Elite','精英')}",
-        f"R={t('Rest','休息')}",
-        f"$={t('Shop','商店')}",
-        f"T={t('Treasure','宝箱')}",
-        f"?={t('Event','事件')}",
-    ]
-    if cur:
-        legend_items.append(f"{c('>','green')}={t('You','你')}")
-    print(f"  {c(' '.join(legend_items), 'dim')}")
+    legend = f"  {c('M','red')}={t('Monster','怪')} {c('E','red')}={t('Elite','英')} R={t('Rest','休')} $={t('Shop','店')} T={t('Treasure','宝')} ?={t('Event','事')} {c('[x]','green')}={t('You','你')} {c(' x ','yellow')}={t('Next','可选')}"
+    print(legend)
     print()
 
 def get_input(prompt, valid_options=None, state=None):
