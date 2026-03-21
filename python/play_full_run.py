@@ -171,18 +171,17 @@ def play_run(seed: str, character: str = "Ironclad", verbose: bool = True):
             elif decision == "event_choice":
                 options = state.get("options", [])
                 if options:
-                    choice = options[0]
+                    # Pick first unlocked option
+                    choice = next((o for o in options if not o.get("is_locked")), options[0])
                     state = send({
                         "cmd": "action",
                         "action": "choose_option",
                         "args": {"option_index": choice["index"]}
                     })
+                    if state and state.get("type") == "error":
+                        state = send({"cmd": "action", "action": "leave_room"})
                 else:
-                    # No options (localization missing), skip event
-                    state = send({
-                        "cmd": "action",
-                        "action": "leave_room"
-                    })
+                    state = send({"cmd": "action", "action": "leave_room"})
 
             elif decision == "rest_site":
                 options = state.get("options", [])
@@ -192,6 +191,9 @@ def play_run(seed: str, character: str = "Ironclad", verbose: bool = True):
                         "action": "choose_option",
                         "args": {"option_index": 0}
                     })
+                    # If choose_option failed, try leaving
+                    if state and state.get("type") == "error":
+                        state = send({"cmd": "action", "action": "leave_room"})
                 else:
                     state = send({"cmd": "action", "action": "leave_room"})
 

@@ -47,7 +47,7 @@ public class Node : GodotObject
         public static readonly StringName ProcessFrame = "ProcessFrame";
     }
 
-    public virtual string Name { get; set; } = "";
+    public virtual StringName Name { get; set; } = "";
 
     public Node? GetParent() => _parent;
 
@@ -57,7 +57,9 @@ public class Node : GodotObject
     }
 
     public T? GetNodeOrNull<T>(string path) where T : class => null;
+    public T? GetNodeOrNull<T>(NodePath path) where T : class => null;
     public T GetNode<T>(string path) where T : class => default!;
+    public T GetNode<T>(NodePath path) where T : class => default!;
 
     public virtual void AddChild(Node child, bool forceReadableName = false, InternalMode mode = InternalMode.Disabled)
     {

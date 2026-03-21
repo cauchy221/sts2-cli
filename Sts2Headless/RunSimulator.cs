@@ -346,10 +346,22 @@ public class RunSimulator
         }
 
         // For rest sites, use RestSiteSynchronizer
-        var restSync = RunManager.Instance.RestSiteSynchronizer;
-        if (_runState?.CurrentRoom is RestSiteRoom)
+        if (_runState?.CurrentRoom is RestSiteRoom restSiteRoom)
         {
-            restSync.ChooseLocalOption(optionIndex).GetAwaiter().GetResult();
+            var restOptions = restSiteRoom.Options;
+            if (restOptions != null && optionIndex >= 0 && optionIndex < restOptions.Count)
+            {
+                try
+                {
+                    RunManager.Instance.RestSiteSynchronizer.ChooseLocalOption(optionIndex).GetAwaiter().GetResult();
+                    _syncCtx.Pump();
+                }
+                catch (Exception ex) { Log($"Rest site choose: {ex.Message}"); }
+            }
+            else
+            {
+                Log($"Rest site: invalid option index {optionIndex}, skipping");
+            }
         }
 
         WaitForActionExecutor();
@@ -359,8 +371,19 @@ public class RunSimulator
     private Dictionary<string, object?> DoLeaveRoom(Player player)
     {
         Log("Leaving room");
-        RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult();
+        try { RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult(); }
+        catch { }
+        _syncCtx.Pump();
         WaitForActionExecutor();
+
+        // If still in a non-combat room, force to map
+        var room = _runState?.CurrentRoom;
+        if (room is RestSiteRoom || room is MerchantRoom || room is EventRoom || room is TreasureRoom)
+        {
+            Log("Force leaving non-combat room to map");
+            try { RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult(); _syncCtx.Pump(); }
+            catch (Exception ex) { Log($"Force leave: {ex.Message}"); }
+        }
         return DetectDecisionPoint();
     }
 
