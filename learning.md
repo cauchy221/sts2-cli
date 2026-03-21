@@ -107,3 +107,11 @@
 - Key insight: need damage amplification EARLIER (Inflame turn 1)
 - Key insight: kill Kin Followers first (59+58hp) to reduce incoming damage
 - Almost won! 20 more HP or 1 more damage card would've done it
+
+## Bug: Combat infinite loop at Bygone Effigy
+- Agent's boss potion loop: `if total_ehp>100` triggers for elite too (127hp)
+- Potion use_potion fails → returns combat_play → rnd==1 still → tries again
+- Fix: limit potion usage to ONE attempt, not loop
+- Also: HP=8 entering Elite is suicide — need hard block on Elite at <50% HP
+- Bygone Effigy: starts sleeping (SleepIntent), wakes up (BuffIntent), then attacks
+  Has SlowPower. Normal combat mechanics, not invulnerable.
