@@ -476,155 +476,143 @@ def show_event(state):
 # ─── Input handling ───
 
 def _render_map(map_data, choice_set=None):
-    """Render a full ASCII map with paths from get_map response.
-
-    choice_set: set of (col, row) tuples for available next nodes (highlighted yellow).
-    """
+    """Render a full ASCII map with paths using a fixed-width character buffer."""
     if choice_set is None:
         choice_set = set()
 
     ctx = map_data.get("context", {})
     act = n(ctx.get("act_name", "?"))
     floor = ctx.get("floor", "?")
+    cur = map_data.get("current_coord")
 
-    type_icons = {
-        "Monster": "⚔", "Elite": "💀", "Boss": "👹",
-        "RestSite": "🏕", "Shop": "🏪", "Treasure": "💎",
-        "Event": "❓", "Unknown": "❓", "Ancient": "🏛",
-        "Unassigned": "·",
+    # Single-width ASCII icons (avoids emoji alignment issues)
+    ICONS = {
+        "Monster": "M", "Elite": "E", "Boss": "B",
+        "RestSite": "R", "Shop": "$", "Treasure": "T",
+        "Event": "?", "Unknown": "?", "Ancient": "A",
+        "Unassigned": ".",
     }
 
     rows = map_data.get("rows", [])
-    cur = map_data.get("current_coord")
+    if not rows:
+        print(f"  {t('No map data','无地图数据')}")
+        return
 
-    # Build lookup: (col, row) → node
-    node_map = {}
+    # Build data structures
+    node_map = {}  # (col, row) → node
+    edge_list = []  # (from_col, from_row, to_col, to_row)
     max_col = 0
+    row_numbers = []
+
     for row in rows:
-        for node in row:
-            col, row_n = node.get("col", 0), node.get("row", 0)
-            node_map[(col, row_n)] = node
+        for nd in row:
+            col, rn = nd.get("col", 0), nd.get("row", 0)
+            node_map[(col, rn)] = nd
             max_col = max(max_col, col)
+            if rn not in row_numbers:
+                row_numbers.append(rn)
+            for ch in (nd.get("children") or []):
+                edge_list.append((col, rn, ch["col"], ch["row"]))
 
-    # Build edge set: (from_col, from_row) → [(to_col, to_row), ...]
-    edges = {}
-    for row in rows:
-        for node in row:
-            col, row_n = node.get("col", 0), node.get("row", 0)
-            children = node.get("children") or []
-            for ch in children:
-                edges.setdefault((col, row_n), []).append((ch["col"], ch["row"]))
-
-    # Column width for spacing
-    CW = 6  # characters per column
+    row_numbers.sort()
     total_cols = max_col + 1
+    CW = 5  # character width per column
 
-    print(f"\n{'═' * 60}")
-    print(f"  {c(f'{act}', 'bold')} — Floor {floor}")
-    if cur:
-        print(f"  You are at ({cur['col']},{cur['row']})")
+    print(f"\n{'═' * (CW * total_cols + 8)}")
+    print(f"  {c(act, 'bold')} — Floor {floor}")
     print()
 
-    # Render from top (boss) to bottom (row 0)
+    # Boss line
     boss = map_data.get("boss", {})
     boss_col = boss.get("col", total_cols // 2)
-    boss_line = " " * (4 + boss_col * CW) + c("👹BOSS", "red")
-    print(boss_line)
+    boss_row = boss.get("row", -1)
+    buf = [" "] * (CW * total_cols)
+    pos = boss_col * CW + CW // 2 - 1
+    # Place "B" at boss position
+    if 0 <= pos < len(buf):
+        buf[pos] = " "
+        buf[pos + 1] = "B" if pos + 1 < len(buf) else "B"
+    node_line = "".join(buf)
+    # Color the B
+    node_line = node_line[:pos] + c("[B]", "red") + node_line[pos+3:] if pos + 3 <= len(buf) else node_line
+    print(f"    {node_line}  BOSS")
 
-    # Connection line from last row to boss
-    last_row_idx = len(rows) - 1
-    if last_row_idx >= 0:
-        last_row = rows[last_row_idx]
-        # Find which nodes connect to boss
-        conn_line = [" "] * (total_cols * CW)
-        for node in last_row:
-            col = node.get("col", 0)
-            children = node.get("children") or []
-            for ch in children:
-                if ch.get("row", -1) == boss.get("row", -1):
-                    pos = col * CW + CW // 2
-                    if 0 <= pos < len(conn_line):
-                        conn_line[pos] = "│"
-        print(f"    {''.join(conn_line)}")
+    # Render rows from top to bottom (highest row first)
+    for ri in range(len(row_numbers) - 1, -1, -1):
+        rn = row_numbers[ri]
 
-    sorted_row_indices = list(range(len(rows) - 1, -1, -1))
-
-    for ri, row_idx in enumerate(sorted_row_indices):
-        row = rows[row_idx]
-        row_num = row[0].get("row", row_idx) if row else row_idx
-
-        # Build node line
-        cells = [" " * CW] * total_cols
-        for node in row:
-            col = node.get("col", 0)
-            typ = node.get("type", "?")
-            icon = type_icons.get(typ, "?")
-            visited = node.get("visited", False)
-            is_cur = (cur and cur["col"] == col and cur["row"] == row_num)
-            is_choice = (col, row_num) in choice_set
-
-            if is_cur:
-                label = c(f"►{icon}", "green")
-            elif is_choice:
-                label = c(f" {icon}", "yellow")
-            elif visited:
-                label = c(f" {icon}", "dim")
-            else:
-                label = f" {icon}"
-
-            # Pad to CW (accounting for ANSI codes)
-            cells[col] = label
-
-        # Print node line with row number
-        # We need manual spacing since icons have variable width (emoji)
-        parts = []
-        for ci in range(total_cols):
-            parts.append(cells[ci])
-            # Add spacing between columns
-            if ci < total_cols - 1:
-                parts.append(" " * (CW - 2))  # adjust for icon width ~2
-        print(f"  {row_num:>2}│ {''.join(parts)}")
-
-        # Draw connection lines to the row above (children)
-        if row_idx > 0:
-            # For each node in this row, draw lines to its parent(s) in row above
-            # Actually, edges go from this row to next row (children).
-            # We need edges from row below (row_idx - 1) pointing to this row.
-            prev_row = rows[row_idx - 1]
-            conn_chars = {}  # position → char
-            for node in prev_row:
-                pcol = node.get("col", 0)
-                prow = node.get("row", row_idx - 1)
-                children = node.get("children") or []
-                for ch in children:
-                    ccol, crow = ch["col"], ch["row"]
-                    if crow != row_num:
-                        continue
-                    # Draw connector from pcol to ccol
-                    p_pos = pcol * CW + CW // 2
-                    c_pos = ccol * CW + CW // 2
-                    if p_pos == c_pos:
-                        conn_chars[p_pos] = "│"
-                    elif p_pos < c_pos:
-                        conn_chars[p_pos] = "╱"  # going up-right from parent
-                        conn_chars[c_pos] = "╱"
-                        # Fill middle with dots or dashes for long connections
-                        for mp in range(p_pos + 1, c_pos):
-                            if mp not in conn_chars:
-                                conn_chars[mp] = "·"
+        # --- Connection line: edges FROM this row TO the row above ---
+        if ri < len(row_numbers) - 1:
+            above_rn = row_numbers[ri + 1]
+            buf = [" "] * (CW * total_cols)
+            for fc, fr, tc, tr in edge_list:
+                if fc == tc and fr == rn and tr == above_rn:
+                    # Straight up: |
+                    pos = fc * CW + CW // 2
+                    if 0 <= pos < len(buf): buf[pos] = "|"
+                elif fr == rn and tr == above_rn:
+                    fp = fc * CW + CW // 2
+                    tp = tc * CW + CW // 2
+                    if fp < tp:
+                        # Going right: /
+                        if 0 <= fp < len(buf): buf[fp] = "/"
+                        if 0 <= tp < len(buf): buf[tp] = "/"
                     else:
-                        conn_chars[p_pos] = "╲"
-                        conn_chars[c_pos] = "╲"
-                        for mp in range(c_pos + 1, p_pos):
-                            if mp not in conn_chars:
-                                conn_chars[mp] = "·"
+                        # Going left: \
+                        if 0 <= tp < len(buf): buf[tp] = "\\"
+                        if 0 <= fp < len(buf): buf[fp] = "\\"
+            print(f"    {''.join(buf)}")
+        else:
+            # Top row: connections to boss
+            buf = [" "] * (CW * total_cols)
+            for fc, fr, tc, tr in edge_list:
+                if fr == rn and tr == boss_row:
+                    pos = fc * CW + CW // 2
+                    if 0 <= pos < len(buf): buf[pos] = "|"
+            print(f"    {''.join(buf)}")
 
-            max_pos = max(conn_chars.keys()) if conn_chars else 0
-            conn_line = []
-            for p in range(max_pos + 1):
-                conn_line.append(conn_chars.get(p, " "))
-            print(f"    {''.join(conn_line)}")
+        # --- Node line ---
+        buf = [" "] * (CW * total_cols)
+        color_inserts = []  # (pos, plain_char, colored_str)
 
+        for col in range(total_cols):
+            nd = node_map.get((col, rn))
+            if not nd:
+                continue
+            icon = ICONS.get(nd.get("type", "?"), "?")
+            is_cur = (cur and cur["col"] == col and cur["row"] == rn)
+            is_choice = (col, rn) in choice_set
+            visited = nd.get("visited", False)
+
+            pos = col * CW + CW // 2
+            if 0 <= pos < len(buf):
+                buf[pos] = icon
+                if is_cur:
+                    color_inserts.append((pos, icon, c(f">{icon}", "green")))
+                elif is_choice:
+                    color_inserts.append((pos, icon, c(icon, "yellow")))
+                elif visited:
+                    color_inserts.append((pos, icon, c(icon, "dim")))
+
+        line = "".join(buf)
+        # Apply colors (process from right to left to preserve positions)
+        for pos, plain, colored in sorted(color_inserts, key=lambda x: -x[0]):
+            line = line[:pos] + colored + line[pos + len(plain):]
+
+        print(f"  {rn:>2}| {line}")
+
+    # Legend
+    legend_items = [
+        f"{c('M','red')}={t('Monster','怪物')}",
+        f"{c('E','red')}={t('Elite','精英')}",
+        f"R={t('Rest','休息')}",
+        f"$={t('Shop','商店')}",
+        f"T={t('Treasure','宝箱')}",
+        f"?={t('Event','事件')}",
+    ]
+    if cur:
+        legend_items.append(f"{c('>','green')}={t('You','你')}")
+    print(f"  {c(' '.join(legend_items), 'dim')}")
     print()
 
 def get_input(prompt, valid_options=None, state=None):
