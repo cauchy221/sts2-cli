@@ -32,6 +32,7 @@ public struct Vector2
     public static Vector2 operator *(Vector2 a, float b) => new(a.X * b, a.Y * b);
     public static Vector2 operator *(float a, Vector2 b) => new(a * b.X, a * b.Y);
     public static Vector2 operator *(Vector2 a, Vector2 b) => new(a.X * b.X, a.Y * b.Y);
+    public static Vector2 operator /(Vector2 a, Vector2 b) => new(a.X / b.X, a.Y / b.Y);
     public static Vector2 operator /(Vector2 a, float b) => new(a.X / b, a.Y / b);
     public static Vector2 operator /(Vector2 a, int b) => new(a.X / b, a.Y / b);
     public static Vector2 operator -(Vector2 v) => new(-v.X, -v.Y);

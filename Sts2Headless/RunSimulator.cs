@@ -12,6 +12,9 @@ using MegaCrit.Sts2.Core.Map;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Models.Characters;
 using MegaCrit.Sts2.Core.Multiplayer;
+using MegaCrit.Sts2.Core.Entities.Merchant;
+using MegaCrit.Sts2.Core.Entities.RestSite;
+using MegaCrit.Sts2.Core.Rewards;
 using MegaCrit.Sts2.Core.Rooms;
 using MegaCrit.Sts2.Core.Runs;
 using MegaCrit.Sts2.Core.TestSupport;
@@ -92,6 +95,11 @@ public class RunSimulator
     private readonly ManualResetEventSlim _turnStarted = new(false);
     private readonly ManualResetEventSlim _combatEnded = new(false);
 
+    // Pending rewards for card selection (populated after combat, before proceeding)
+    private List<Reward>? _pendingRewards;
+    private CardReward? _pendingCardReward;
+    private bool _rewardsProcessed; // prevents re-generating rewards after card selection
+
     public Dictionary<string, object?> StartRun(string character, int ascension = 0, string? seed = null)
     {
         try
@@ -167,16 +175,20 @@ public class RunSimulator
                     return DoPlayCard(player, args);
                 case "end_turn":
                     return DoEndTurn(player);
-                case "pick_card":
-                    return DoPickCard(player, args);
-                case "skip_card":
-                    return DoSkipCard(player);
-                case "pick_reward":
-                    return DoPickReward(player, args);
-                case "skip_reward":
-                    return DoSkipReward(player);
                 case "choose_option":
                     return DoChooseOption(player, args);
+                case "select_card_reward":
+                    return DoSelectCardReward(player, args);
+                case "skip_card_reward":
+                    return DoSkipCardReward(player);
+                case "buy_card":
+                    return DoBuyCard(player, args);
+                case "buy_relic":
+                    return DoBuyRelic(player, args);
+                case "buy_potion":
+                    return DoBuyPotion(player, args);
+                case "remove_card":
+                    return DoRemoveCard(player);
                 case "leave_room":
                     return DoLeaveRoom(player);
                 case "proceed":
@@ -197,6 +209,11 @@ public class RunSimulator
     {
         if (args == null || !args.ContainsKey("col") || !args.ContainsKey("row"))
             return Error("select_map_node requires 'col' and 'row'");
+
+        // Reset reward tracking for new room
+        _rewardsProcessed = false;
+        _pendingCardReward = null;
+        _pendingRewards = null;
 
         var col = Convert.ToInt32(args["col"]);
         var row = Convert.ToInt32(args["row"]);
@@ -287,6 +304,9 @@ public class RunSimulator
             }
         }
 
+        // Ensure no actions are still running before ending turn
+        WaitForActionExecutor();
+
         Log($"Ending turn (round={CombatManager.Instance.DebugOnlyGetState()?.RoundNumber ?? 0})");
         _turnStarted.Reset();
         _combatEnded.Reset();
@@ -295,33 +315,192 @@ public class RunSimulator
         PlayerCmd.EndTurn(player, canBackOut: false);
         _syncCtx.Pump();
 
+        // Fallback: if turn didn't complete synchronously, wait briefly then force retry
+        if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
+        {
+            for (int i = 0; i < 50; i++)
+            {
+                _syncCtx.Pump();
+                if (_turnStarted.IsSet || _combatEnded.IsSet) break;
+                if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
+                if (CombatManager.Instance.IsPlayPhase) break;
+                Thread.Sleep(5);
+            }
+
+            // If STILL stuck, the WaitUntilQueue TCS is likely deadlocked.
+            // Cancel the ActionExecutor to break out, then re-trigger EndTurn.
+            if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
+            {
+                Log("EndTurn stuck, cancelling and retrying...");
+                try
+                {
+                    RunManager.Instance.ActionExecutor.Cancel();
+                    _syncCtx.Pump();
+                    Thread.Sleep(50);
+                    _syncCtx.Pump();
+
+                    // Reset the player ready state and try again
+                    CombatManager.Instance.UndoReadyToEndTurn(player);
+                    _syncCtx.Pump();
+                    PlayerCmd.EndTurn(player, canBackOut: false);
+                    _syncCtx.Pump();
+
+                    for (int i = 0; i < 50; i++)
+                    {
+                        _syncCtx.Pump();
+                        if (_turnStarted.IsSet || _combatEnded.IsSet) break;
+                        if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
+                        if (CombatManager.Instance.IsPlayPhase) break;
+                        Thread.Sleep(5);
+                    }
+                }
+                catch (Exception ex) { Log($"Cancel retry: {ex.Message}"); }
+            }
+        }
+
         return DetectDecisionPoint();
     }
 
-    private Dictionary<string, object?> DoPickCard(Player player, Dictionary<string, object?>? args)
+    private Dictionary<string, object?> DoSelectCardReward(Player player, Dictionary<string, object?>? args)
     {
-        // For now, auto-accept all rewards (TestMode handles this in RewardsSet.Offer)
-        // This is used when we need to pick a specific card from card reward
-        Log("Pick card - proceeding");
-        return DoProceed(player);
+        if (_pendingCardReward == null)
+            return Error("No pending card reward");
+        if (args == null || !args.ContainsKey("card_index"))
+            return Error("select_card_reward requires 'card_index'");
+
+        var cardIndex = Convert.ToInt32(args["card_index"]);
+        var cards = _pendingCardReward.Cards.ToList();
+        if (cardIndex < 0 || cardIndex >= cards.Count)
+            return Error($"Invalid card index {cardIndex}, {cards.Count} cards available");
+
+        var card = cards[cardIndex];
+        Log($"Selected card reward: {card.GetType().Name}");
+
+        // Add card to deck
+        try
+        {
+            MegaCrit.Sts2.Core.Commands.CardPileCmd
+                .Add(card, MegaCrit.Sts2.Core.Entities.Cards.PileType.Deck)
+                .GetAwaiter().GetResult();
+            _syncCtx.Pump();
+            RunManager.Instance.RewardSynchronizer.SyncLocalObtainedCard(card);
+        }
+        catch (Exception ex) { Log($"Add card to deck: {ex.Message}"); }
+
+        _pendingCardReward = null;
+        // Check if more rewards pending
+        return DetectDecisionPoint();
     }
 
-    private Dictionary<string, object?> DoSkipCard(Player player)
+    private Dictionary<string, object?> DoSkipCardReward(Player player)
     {
-        Log("Skip card - proceeding");
-        return DoProceed(player);
+        if (_pendingCardReward != null)
+        {
+            Log("Skipping card reward");
+            _pendingCardReward.OnSkipped();
+            _pendingCardReward = null;
+        }
+        return DetectDecisionPoint();
     }
 
-    private Dictionary<string, object?> DoPickReward(Player player, Dictionary<string, object?>? args)
+    private Dictionary<string, object?> DoBuyCard(Player player, Dictionary<string, object?>? args)
     {
-        Log("Pick reward - proceeding");
-        return DoProceed(player);
+        if (_runState?.CurrentRoom is not MerchantRoom merchantRoom)
+            return Error("Not in a shop");
+        if (args == null || !args.ContainsKey("card_index"))
+            return Error("buy_card requires 'card_index'");
+
+        var idx = Convert.ToInt32(args["card_index"]);
+        var allEntries = merchantRoom.Inventory.CharacterCardEntries
+            .Concat(merchantRoom.Inventory.ColorlessCardEntries).ToList();
+        if (idx < 0 || idx >= allEntries.Count)
+            return Error($"Invalid card index {idx}");
+
+        var entry = allEntries[idx];
+        if (!entry.IsStocked) return Error("Card already purchased");
+        if (player.Gold < entry.Cost) return Error("Not enough gold");
+
+        try
+        {
+            entry.OnTryPurchaseWrapper(null).GetAwaiter().GetResult();
+            _syncCtx.Pump();
+            Log($"Bought card: {entry.CreationResult.Card.GetType().Name} for {entry.Cost}g");
+        }
+        catch (Exception ex) { return Error($"Buy card failed: {ex.Message}"); }
+
+        return DetectDecisionPoint();
     }
 
-    private Dictionary<string, object?> DoSkipReward(Player player)
+    private Dictionary<string, object?> DoBuyRelic(Player player, Dictionary<string, object?>? args)
     {
-        Log("Skip reward - proceeding");
-        return DoProceed(player);
+        if (_runState?.CurrentRoom is not MerchantRoom merchantRoom)
+            return Error("Not in a shop");
+        if (args == null || !args.ContainsKey("relic_index"))
+            return Error("buy_relic requires 'relic_index'");
+
+        var idx = Convert.ToInt32(args["relic_index"]);
+        var entries = merchantRoom.Inventory.RelicEntries;
+        if (idx < 0 || idx >= entries.Count) return Error($"Invalid relic index {idx}");
+
+        var entry = entries[idx];
+        if (!entry.IsStocked) return Error("Relic already purchased");
+        if (player.Gold < entry.Cost) return Error("Not enough gold");
+
+        try
+        {
+            entry.OnTryPurchaseWrapper(null).GetAwaiter().GetResult();
+            _syncCtx.Pump();
+            Log($"Bought relic: {entry.Model.GetType().Name} for {entry.Cost}g");
+        }
+        catch (Exception ex) { return Error($"Buy relic failed: {ex.Message}"); }
+
+        return DetectDecisionPoint();
+    }
+
+    private Dictionary<string, object?> DoBuyPotion(Player player, Dictionary<string, object?>? args)
+    {
+        if (_runState?.CurrentRoom is not MerchantRoom merchantRoom)
+            return Error("Not in a shop");
+        if (args == null || !args.ContainsKey("potion_index"))
+            return Error("buy_potion requires 'potion_index'");
+
+        var idx = Convert.ToInt32(args["potion_index"]);
+        var entries = merchantRoom.Inventory.PotionEntries;
+        if (idx < 0 || idx >= entries.Count) return Error($"Invalid potion index {idx}");
+
+        var entry = entries[idx];
+        if (!entry.IsStocked) return Error("Potion already purchased");
+        if (player.Gold < entry.Cost) return Error("Not enough gold");
+
+        try
+        {
+            entry.OnTryPurchaseWrapper(null).GetAwaiter().GetResult();
+            _syncCtx.Pump();
+            Log($"Bought potion: {entry.Model.GetType().Name} for {entry.Cost}g");
+        }
+        catch (Exception ex) { return Error($"Buy potion failed: {ex.Message}"); }
+
+        return DetectDecisionPoint();
+    }
+
+    private Dictionary<string, object?> DoRemoveCard(Player player)
+    {
+        if (_runState?.CurrentRoom is not MerchantRoom merchantRoom)
+            return Error("Not in a shop");
+
+        var removal = merchantRoom.Inventory.CardRemovalEntry;
+        if (removal == null) return Error("No card removal available");
+        if (player.Gold < removal.Cost) return Error("Not enough gold");
+
+        try
+        {
+            removal.OnTryPurchaseWrapper(null).GetAwaiter().GetResult();
+            _syncCtx.Pump();
+            Log($"Removed card for {removal.Cost}g");
+        }
+        catch (Exception ex) { return Error($"Remove card failed: {ex.Message}"); }
+
+        return DetectDecisionPoint();
     }
 
     private Dictionary<string, object?> DoChooseOption(Player player, Dictionary<string, object?>? args)
@@ -423,6 +602,12 @@ public class RunSimulator
         if (player.Creature != null && player.Creature.IsDead)
         {
             return GameOverState(false);
+        }
+
+        // Check if there's a pending card reward
+        if (_pendingCardReward != null)
+        {
+            return CardRewardState(player, _runState.CurrentRoom as CombatRoom);
         }
 
         // Check if RunManager reports game over
@@ -617,57 +802,108 @@ public class RunSimulator
 
     private Dictionary<string, object?> DetectPostCombatState(Player player, CombatRoom combatRoom)
     {
-        // Combat has ended. In TestMode, RewardsSet.Offer auto-selects all rewards.
         Log($"Post-combat: RoomType={combatRoom.RoomType}, IsPreFinished={combatRoom.IsPreFinished}");
-
-        // Wait for async reward processing to complete
-        _syncCtx.Pump();
-        Thread.Sleep(100);
         _syncCtx.Pump();
 
-        // Check if boss fight → act transition
+        // Generate rewards manually instead of using TestMode auto-accept
+        if (_pendingRewards == null && !_rewardsProcessed)
+        {
+            try
+            {
+                var rewardsSet = new RewardsSet(player).WithRewardsFromRoom(combatRoom);
+                var rewards = rewardsSet.GenerateWithoutOffering().GetAwaiter().GetResult();
+                _syncCtx.Pump();
+
+                // Auto-collect gold and potions, but present card choices to agent
+                var cardRewards = new List<CardReward>();
+                foreach (var reward in rewards)
+                {
+                    if (reward is GoldReward || reward is MegaCrit.Sts2.Core.Rewards.RelicReward
+                        || reward is MegaCrit.Sts2.Core.Rewards.PotionReward)
+                    {
+                        try { reward.OnSelectWrapper().GetAwaiter().GetResult(); _syncCtx.Pump(); }
+                        catch (Exception ex) { Log($"Auto-collect reward: {ex.Message}"); }
+                    }
+                    else if (reward is CardReward cr)
+                    {
+                        cardRewards.Add(cr);
+                    }
+                }
+
+                if (cardRewards.Count > 0)
+                {
+                    _pendingCardReward = cardRewards[0];
+                    _pendingRewards = rewards;
+                    return CardRewardState(player, combatRoom);
+                }
+
+                _pendingRewards = null;
+            }
+            catch (Exception ex) { Log($"Generate rewards: {ex.Message}"); }
+        }
+
+        // No more pending rewards — proceed
+        _pendingCardReward = null;
+        _pendingRewards = null;
+        _rewardsProcessed = true;
+
+        // Boss → next act
         if (combatRoom.RoomType == RoomType.Boss)
         {
             Log("Boss defeated, entering next act");
-            RunManager.Instance.EnterNextAct().GetAwaiter().GetResult();
-            _syncCtx.Pump();
-            WaitForActionExecutor();
+            try
+            {
+                RunManager.Instance.EnterNextAct().GetAwaiter().GetResult();
+                _syncCtx.Pump();
+                WaitForActionExecutor();
+            }
+            catch (Exception ex) { Log($"EnterNextAct: {ex.Message}"); }
             return DetectDecisionPoint();
         }
 
-        // Proceed from rewards to map
+        // Normal → go to map
+        ForceToMap();
+        return MapSelectState();
+    }
+
+    private Dictionary<string, object?> CardRewardState(Player player, CombatRoom? combatRoom)
+    {
+        if (_pendingCardReward == null)
+            return DetectPostCombatState(player, combatRoom ?? (_runState?.CurrentRoom as CombatRoom)!);
+
+        var cards = _pendingCardReward.Cards.Select((c, i) => new Dictionary<string, object?>
+        {
+            ["index"] = i,
+            ["id"] = c.Id.ToString(),
+            ["name"] = c.GetType().Name,
+            ["type"] = c.Type.ToString(),
+            ["rarity"] = c.Rarity.ToString(),
+        }).ToList();
+
+        return new Dictionary<string, object?>
+        {
+            ["type"] = "decision",
+            ["decision"] = "card_reward",
+            ["cards"] = cards,
+            ["can_skip"] = _pendingCardReward.CanSkip,
+            ["player"] = PlayerSummary(_runState!.Players[0]),
+        };
+    }
+
+    private void ForceToMap()
+    {
         try
         {
             RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult();
+            _syncCtx.Pump();
         }
-        catch (Exception ex)
-        {
-            Log($"ProceedFromTerminalRewardsScreen: {ex.Message}");
-        }
+        catch { }
 
-        _syncCtx.Pump();
-        WaitForActionExecutor();
-
-        // Check if we're now at the map
-        var room = _runState?.CurrentRoom;
-        if (room is MapRoom)
+        if (_runState?.CurrentRoom is not MapRoom)
         {
-            return MapSelectState();
+            try { RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult(); _syncCtx.Pump(); }
+            catch (Exception ex) { Log($"ForceToMap: {ex.Message}"); }
         }
-
-        // If still in combat room, force transition to map
-        Log("Force entering map room after combat");
-        try
-        {
-            RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult();
-            for (int i = 0; i < 20; i++) { _syncCtx.Pump(); Thread.Sleep(20); }
-        }
-        catch (Exception ex)
-        {
-            Log($"EnterRoom(MapRoom) failed: {ex.Message}");
-        }
-
-        return MapSelectState();
     }
 
     private Dictionary<string, object?> EventChoiceState(EventRoom eventRoom)
@@ -726,29 +962,24 @@ public class RunSimulator
     private Dictionary<string, object?> RestSiteState(RestSiteRoom restRoom)
     {
         var options = restRoom.Options;
+        var player = _runState!.Players[0];
+
         if (options == null || options.Count == 0)
         {
-            // Rest site needs localization for options. Auto-heal and proceed.
-            Log("Rest site has no options, auto-skipping to map");
-            // Heal the player manually (rest site default heal is 30% max HP)
-            var player = _runState!.Players[0];
+            // Fallback: manually heal and proceed
+            Log("Rest site has no options, auto-healing");
             var healAmount = (int)(player.Creature.MaxHp * 0.3m);
-            player.Creature.HealInternal(healAmount);
-            Log($"Auto-healed for {healAmount} HP");
-            try
-            {
-                RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult();
-                for (int i = 0; i < 20; i++) { _syncCtx.Pump(); Thread.Sleep(20); }
-            }
-            catch (Exception ex) { Log($"Skip rest site failed: {ex.Message}"); }
+            try { player.Creature.HealInternal(healAmount); } catch { }
+            ForceToMap();
             return MapSelectState();
         }
 
         var optionList = options.Select((opt, i) => new Dictionary<string, object?>
         {
             ["index"] = i,
+            ["option_id"] = opt.OptionId,
             ["name"] = opt.GetType().Name,
-            ["description"] = opt.Description?.ToString() ?? opt.GetType().Name,
+            ["is_enabled"] = opt.IsEnabled,
         }).ToList();
 
         return new Dictionary<string, object?>
@@ -756,30 +987,60 @@ public class RunSimulator
             ["type"] = "decision",
             ["decision"] = "rest_site",
             ["options"] = optionList,
-            ["player"] = PlayerSummary(_runState!.Players[0]),
+            ["player"] = PlayerSummary(player),
         };
     }
 
     private Dictionary<string, object?> ShopState(MerchantRoom merchantRoom, Player player)
     {
-        // Auto-skip shop — force enter map room
-        Log("Shop room — auto-leaving in headless mode");
-        try
+        var inv = merchantRoom.Inventory;
+        if (inv == null) { ForceToMap(); return MapSelectState(); }
+
+        var cards = inv.CharacterCardEntries.Concat(inv.ColorlessCardEntries)
+            .Select((e, i) => new Dictionary<string, object?>
+            {
+                ["index"] = i,
+                ["name"] = e.CreationResult?.Card?.GetType().Name ?? "?",
+                ["type"] = e.CreationResult?.Card?.Type.ToString() ?? "?",
+                ["price"] = e.Cost,
+                ["is_stocked"] = e.IsStocked,
+                ["on_sale"] = e.IsOnSale,
+            }).ToList();
+
+        var relics = inv.RelicEntries.Select((e, i) => new Dictionary<string, object?>
         {
-            RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult();
-            for (int i = 0; i < 20; i++) { _syncCtx.Pump(); Thread.Sleep(20); }
-        }
-        catch (Exception ex)
+            ["index"] = i,
+            ["name"] = e.Model?.GetType().Name ?? "?",
+            ["price"] = e.Cost,
+            ["is_stocked"] = e.IsStocked,
+        }).ToList();
+
+        var potions = inv.PotionEntries.Select((e, i) => new Dictionary<string, object?>
         {
-            Log($"Skip shop failed: {ex.Message}");
-        }
-        return MapSelectState();
+            ["index"] = i,
+            ["name"] = e.Model?.GetType().Name ?? "?",
+            ["price"] = e.Cost,
+            ["is_stocked"] = e.IsStocked,
+        }).ToList();
+
+        var removal = merchantRoom.Inventory.CardRemovalEntry;
+
+        return new Dictionary<string, object?>
+        {
+            ["type"] = "decision",
+            ["decision"] = "shop",
+            ["cards"] = cards,
+            ["relics"] = relics,
+            ["potions"] = potions,
+            ["card_removal_cost"] = removal?.Cost,
+            ["player"] = PlayerSummary(player),
+        };
     }
 
     private Dictionary<string, object?> TreasureState(TreasureRoom treasureRoom)
     {
-        // Auto-handle treasure room and proceed to map
-        Log("Treasure room — auto-proceeding");
+        // Treasure rooms give relics via TreasureRoomRelicSynchronizer
+        Log("Treasure room — collecting rewards");
         try
         {
             treasureRoom.DoNormalRewards().GetAwaiter().GetResult();
@@ -789,12 +1050,7 @@ public class RunSimulator
         }
         catch (Exception ex) { Log($"Treasure rewards: {ex.Message}"); }
 
-        try
-        {
-            RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult();
-            for (int i = 0; i < 20; i++) { _syncCtx.Pump(); Thread.Sleep(20); }
-        }
-        catch (Exception ex) { Log($"Skip treasure failed: {ex.Message}"); }
+        ForceToMap();
         return MapSelectState();
     }
 

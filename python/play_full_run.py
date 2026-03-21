@@ -185,27 +185,42 @@ def play_run(seed: str, character: str = "Ironclad", verbose: bool = True):
 
             elif decision == "rest_site":
                 options = state.get("options", [])
-                if options:
+                # Prefer heal (HEAL), then smith
+                enabled = [o for o in options if o.get("is_enabled", True)]
+                heal = next((o for o in enabled if o.get("option_id") == "HEAL"), None)
+                choice = heal or (enabled[0] if enabled else None)
+                if choice:
                     state = send({
                         "cmd": "action",
                         "action": "choose_option",
-                        "args": {"option_index": 0}
+                        "args": {"option_index": choice["index"]}
                     })
-                    # If choose_option failed, try leaving
                     if state and state.get("type") == "error":
                         state = send({"cmd": "action", "action": "leave_room"})
                 else:
                     state = send({"cmd": "action", "action": "leave_room"})
 
-            elif decision in ("card_reward", "shop", "treasure"):
-                state = send({"cmd": "action", "action": "proceed"})
+            elif decision == "card_reward":
+                # Pick the first card offered
+                cards = state.get("cards", [])
+                if cards:
+                    state = send({
+                        "cmd": "action",
+                        "action": "select_card_reward",
+                        "args": {"card_index": 0}
+                    })
+                else:
+                    state = send({"cmd": "action", "action": "skip_card_reward"})
+
+            elif decision == "shop":
+                # Simple shop strategy: just leave (random agent doesn't shop)
+                state = send({"cmd": "action", "action": "leave_room"})
 
             elif decision == "unknown":
-                print(f"  Unknown decision point: {state}")
                 state = send({"cmd": "action", "action": "proceed"})
 
             else:
-                print(f"  Unhandled decision: {decision}")
+                state = send({"cmd": "action", "action": "proceed"})
                 state = send({"cmd": "action", "action": "proceed"})
 
         print(f"  Reached max steps ({max_steps})")

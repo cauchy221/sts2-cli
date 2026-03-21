@@ -51,7 +51,7 @@ public class Node : GodotObject
 
     public Node? GetParent() => _parent;
 
-    public Godot.Collections.Array<Node> GetChildren()
+    public Godot.Collections.Array<Node> GetChildren(bool includeInternal = false)
     {
         return new Godot.Collections.Array<Node>(_children);
     }
@@ -85,7 +85,10 @@ public class Node : GodotObject
 
     public Tween CreateTween() => new Tween();
     public Viewport GetViewport() => new Viewport();
-    public double GetProcessDeltaTime() => 0.016; // ~60fps
+    public double GetProcessDeltaTime() => 0.016;
+    public bool IsAncestorOf(Node node) => false;
+    public bool IsInsideTree() => false;
+    public int GetChildCount(bool includeInternal = false) => _children.Count;
 
     public void CallDeferred(StringName method, params Variant[] args) { }
 
