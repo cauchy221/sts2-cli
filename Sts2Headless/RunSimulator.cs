@@ -262,6 +262,10 @@ public class RunSimulator
                     return DoBuyPotion(player, args);
                 case "remove_card":
                     return DoRemoveCard(player);
+                case "use_potion":
+                    return DoUsePotion(player, args);
+                case "discard_potion":
+                    return DoDiscardPotion(player, args);
                 case "leave_room":
                     return DoLeaveRoom(player);
                 case "proceed":
@@ -576,6 +580,54 @@ public class RunSimulator
         return DetectDecisionPoint();
     }
 
+    private Dictionary<string, object?> DoUsePotion(Player player, Dictionary<string, object?>? args)
+    {
+        if (args == null || !args.ContainsKey("potion_index"))
+            return Error("use_potion requires 'potion_index'");
+
+        var idx = Convert.ToInt32(args["potion_index"]);
+        var potionsList = player.Potions?.ToList() ?? new();
+        if (idx < 0 || idx >= potionsList.Count) return Error($"Invalid potion index {idx}");
+        var potion = potionsList[idx];
+        if (potion == null) return Error($"No potion at index {idx}");
+
+        Creature? target = null;
+        if (args.TryGetValue("target_index", out var tObj) && tObj != null)
+        {
+            var targetIdx = Convert.ToInt32(tObj);
+            var combatState = CombatManager.Instance.DebugOnlyGetState();
+            if (combatState != null)
+            {
+                var enemies = combatState.Enemies.Where(e => e != null && e.IsAlive).ToList();
+                if (targetIdx >= 0 && targetIdx < enemies.Count)
+                    target = enemies[targetIdx];
+            }
+        }
+
+        Log($"Using potion: {potion.GetType().Name}");
+        var action = new MegaCrit.Sts2.Core.GameActions.UsePotionAction(potion, target, CombatManager.Instance.IsInProgress);
+        RunManager.Instance.ActionQueueSet.EnqueueWithoutSynchronizing(action);
+        WaitForActionExecutor();
+
+        return DetectDecisionPoint();
+    }
+
+    private Dictionary<string, object?> DoDiscardPotion(Player player, Dictionary<string, object?>? args)
+    {
+        if (args == null || !args.ContainsKey("potion_index"))
+            return Error("discard_potion requires 'potion_index'");
+
+        var idx = Convert.ToInt32(args["potion_index"]);
+        var potionsList = player.Potions?.ToList() ?? new();
+        if (idx < 0 || idx >= potionsList.Count) return Error($"Invalid potion index {idx}");
+        var potion = potionsList[idx];
+        if (potion == null) return Error($"No potion at index {idx}");
+
+        MegaCrit.Sts2.Core.Commands.PotionCmd.Discard(potion).GetAwaiter().GetResult();
+        _syncCtx.Pump();
+        return DetectDecisionPoint();
+    }
+
     private Dictionary<string, object?> DoChooseOption(Player player, Dictionary<string, object?>? args)
     {
         if (args == null || !args.ContainsKey("option_index"))
@@ -865,22 +917,57 @@ public class RunSimulator
             };
         }).ToList() ?? new();
 
+        var playerCreatures = combatState?.PlayerCreatures?.ToList();
+
         var enemies = combatState?.Enemies?
             .Where(e => e != null && e.IsAlive)
-            .Select((e, i) => new Dictionary<string, object?>
+            .Select((e, i) =>
             {
-                ["index"] = i,
-                ["name"] = _loc.Monster(e.Monster?.Id.Entry ?? "UNKNOWN"),
-                ["hp"] = e.CurrentHp,
-                ["max_hp"] = e.MaxHp,
-                ["block"] = e.Block,
-                ["intends_attack"] = e.Monster?.IntendsToAttack ?? false,
+                // Extract detailed intent info
+                var intents = new List<Dictionary<string, object?>>();
+                try
+                {
+                    if (e.Monster?.NextMove?.Intents != null)
+                    {
+                        foreach (var intent in e.Monster.NextMove.Intents)
+                        {
+                            var intentInfo = new Dictionary<string, object?>
+                            {
+                                ["type"] = intent.IntentType.ToString(),
+                            };
+                            // Get damage for attack intents
+                            if (intent is MegaCrit.Sts2.Core.MonsterMoves.Intents.AttackIntent atk && playerCreatures != null)
+                            {
+                                try
+                                {
+                                    intentInfo["damage"] = atk.GetTotalDamage(playerCreatures, e);
+                                    if (atk.Repeats > 1) intentInfo["hits"] = atk.Repeats;
+                                }
+                                catch { }
+                            }
+                            intents.Add(intentInfo);
+                        }
+                    }
+                }
+                catch { }
+
+                return new Dictionary<string, object?>
+                {
+                    ["index"] = i,
+                    ["name"] = _loc.Monster(e.Monster?.Id.Entry ?? "UNKNOWN"),
+                    ["hp"] = e.CurrentHp,
+                    ["max_hp"] = e.MaxHp,
+                    ["block"] = e.Block,
+                    ["intents"] = intents.Count > 0 ? intents : null,
+                    ["intends_attack"] = e.Monster?.IntendsToAttack ?? false,
+                };
             }).ToList() ?? new();
 
-        return new Dictionary<string, object?>
+        var result = new Dictionary<string, object?>
         {
             ["type"] = "decision",
             ["decision"] = "combat_play",
+            ["context"] = RunContext(),
             ["round"] = combatState?.RoundNumber ?? 0,
             ["energy"] = pcs?.Energy ?? 0,
             ["max_energy"] = pcs?.MaxEnergy ?? 0,
@@ -890,6 +977,7 @@ public class RunSimulator
             ["draw_pile_count"] = pcs?.DrawPile?.Cards?.Count ?? 0,
             ["discard_pile_count"] = pcs?.DiscardPile?.Cards?.Count ?? 0,
         };
+        return result;
     }
 
     private Dictionary<string, object?> DetectPostCombatState(Player player, CombatRoom combatRoom)
@@ -1222,9 +1310,39 @@ public class RunSimulator
             ["max_hp"] = player.Creature?.MaxHp ?? 0,
             ["block"] = player.Creature?.Block ?? 0,
             ["gold"] = player.Gold,
-            ["relics"] = player.Relics?.Select(r => _loc.Relic(r.Id.Entry)).ToList(),
-            ["potions"] = player.Potions?.Where(p => p != null).Select(p => _loc.Potion(p!.Id.Entry)).ToList(),
+            ["relics"] = player.Relics?.Select(r => new Dictionary<string, object?>
+            {
+                ["name"] = _loc.Relic(r.Id.Entry),
+                ["description"] = _loc.Bilingual("relics", r.Id.Entry + ".description"),
+            }).ToList(),
+            ["potions"] = player.Potions?.Select((p, i) => p == null ? null : new Dictionary<string, object?>
+            {
+                ["index"] = i,
+                ["name"] = _loc.Potion(p.Id.Entry),
+                ["description"] = _loc.Bilingual("potions", p.Id.Entry + ".description"),
+            }).Where(x => x != null).ToList(),
             ["deck_size"] = player.Deck?.Cards?.Count ?? 0,
+            ["deck"] = player.Deck?.Cards?.Select(c => new Dictionary<string, object?>
+            {
+                ["id"] = c.Id.ToString(),
+                ["name"] = _loc.Card(c.Id.Entry),
+                ["cost"] = c.EnergyCost?.GetResolved() ?? 0,
+                ["type"] = c.Type.ToString(),
+                ["upgraded"] = c.IsUpgraded,
+            }).ToList(),
+        };
+    }
+
+    /// <summary>Common context added to every decision point.</summary>
+    private Dictionary<string, object?> RunContext()
+    {
+        if (_runState == null) return new();
+        return new Dictionary<string, object?>
+        {
+            ["act"] = _runState.CurrentActIndex + 1,
+            ["act_name"] = _loc.Act(_runState.Act?.Id.Entry ?? "OVERGROWTH"),
+            ["floor"] = _runState.ActFloor,
+            ["room_type"] = _runState.CurrentRoom?.RoomType.ToString(),
         };
     }
 
