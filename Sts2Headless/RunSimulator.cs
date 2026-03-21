@@ -170,7 +170,7 @@ public class RunSimulator
     private readonly HeadlessCardSelector _cardSelector = new();
     // Pending bundle selection (Scroll Boxes: pick 1 of N packs)
     private IReadOnlyList<IReadOnlyList<CardModel>>? _pendingBundles;
-    private TaskCompletionSource<int>? _pendingBundleTcs;
+    private TaskCompletionSource<IEnumerable<CardModel>>? _pendingBundleTcs;
 
     public Dictionary<string, object?> StartRun(string character, int ascension = 0, string? seed = null)
     {
@@ -597,12 +597,15 @@ public class RunSimulator
 
         var idx = Convert.ToInt32(args["bundle_index"]);
         Log($"Bundle selection: pack {idx}");
-        _pendingBundleTcs.TrySetResult(idx);
+        var bundles = _pendingBundles;
+        var tcs = _pendingBundleTcs;
         _pendingBundles = null;
         _pendingBundleTcs = null;
 
-        // Wait for the rest of the event to complete
-        Thread.Sleep(100);
+        // Set result directly (no ContinueWith/ThreadPool)
+        var selected = (idx >= 0 && idx < bundles.Count) ? bundles[idx] : bundles[0];
+        tcs.TrySetResult(selected);
+
         _syncCtx.Pump();
         WaitForActionExecutor();
         return DetectDecisionPoint();
@@ -2104,16 +2107,10 @@ public class RunSimulator
             if (sim != null)
             {
                 sim._pendingBundles = bundles;
-                sim._pendingBundleTcs = new TaskCompletionSource<int>();
+                sim._pendingBundleTcs = new TaskCompletionSource<IEnumerable<CardModel>>();
                 Console.Error.WriteLine($"[SIM] Bundle selection pending: {bundles.Count} packs");
 
-                __result = sim._pendingBundleTcs.Task.ContinueWith(t =>
-                {
-                    var idx = t.Result;
-                    if (idx >= 0 && idx < bundles.Count)
-                        return (IEnumerable<CardModel>)bundles[idx];
-                    return (IEnumerable<CardModel>)bundles[0];
-                });
+                __result = sim._pendingBundleTcs.Task;
                 return false;
             }
 
