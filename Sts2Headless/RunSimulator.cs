@@ -184,6 +184,8 @@ public class RunSimulator
     private readonly ManualResetEventSlim _turnStarted = new(false);
     private readonly ManualResetEventSlim _combatEnded = new(false);
     private static readonly LocLookup _loc = new();
+    private bool _eventOptionChosen;
+    private int _lastEventOptionCount;
 
     // Pending rewards for card selection (populated after combat, before proceeding)
     private List<Reward>? _pendingRewards;
@@ -318,9 +320,11 @@ public class RunSimulator
         if (args == null || !args.ContainsKey("col") || !args.ContainsKey("row"))
             return Error("select_map_node requires 'col' and 'row'");
 
-        // Reset reward tracking for new room
+        // Reset tracking for new room
         _rewardsProcessed = false;
         _pendingCardReward = null;
+        _eventOptionChosen = false;
+        _lastEventOptionCount = 0;
         _pendingRewards = null;
 
         var col = Convert.ToInt32(args["col"]);
@@ -471,6 +475,20 @@ public class RunSimulator
 
     private Dictionary<string, object?> DoSelectCardReward(Player player, Dictionary<string, object?>? args)
     {
+        // Handle event-triggered card reward (blocking GetSelectedCardReward)
+        if (_cardSelector.HasPendingReward)
+        {
+            if (args == null || !args.ContainsKey("card_index"))
+                return Error("select_card_reward requires 'card_index'");
+            var idx = Convert.ToInt32(args["card_index"]);
+            Log($"Resolving event card reward: index {idx}");
+            _cardSelector.ResolveReward(idx);
+            Thread.Sleep(50);
+            _syncCtx.Pump();
+            WaitForActionExecutor();
+            return DetectDecisionPoint();
+        }
+
         if (_pendingCardReward == null)
             return Error("No pending card reward");
         if (args == null || !args.ContainsKey("card_index"))
@@ -502,6 +520,15 @@ public class RunSimulator
 
     private Dictionary<string, object?> DoSkipCardReward(Player player)
     {
+        if (_cardSelector.HasPendingReward)
+        {
+            Log("Skipping event card reward");
+            _cardSelector.SkipReward();
+            Thread.Sleep(50);
+            _syncCtx.Pump();
+            WaitForActionExecutor();
+            return DetectDecisionPoint();
+        }
         if (_pendingCardReward != null)
         {
             Log("Skipping card reward");
@@ -803,6 +830,8 @@ public class RunSimulator
                 {
                     try
                     {
+                        _eventOptionChosen = true;
+                        _lastEventOptionCount = options.Count;
                         // Run on thread pool so GetSelectedCards can block
                         var task = Task.Run(() => options[optionIndex].Chosen());
                         // Wait briefly, but if card selection is pending, return early
@@ -902,12 +931,18 @@ public class RunSimulator
             var bundles = _pendingBundles.Select((bundle, i) => new Dictionary<string, object?>
             {
                 ["index"] = i,
-                ["cards"] = bundle.Select(card => new Dictionary<string, object?>
+                ["cards"] = bundle.Select(card =>
                 {
-                    ["name"] = _loc.Card(card.Id.Entry),
-                    ["cost"] = card.EnergyCost?.GetResolved() ?? 0,
-                    ["type"] = card.Type.ToString(),
-                    ["description"] = _loc.Bilingual("cards", card.Id.Entry + ".description"),
+                    var stats = new Dictionary<string, object?>();
+                    try { foreach (var dv in card.DynamicVars.Values) stats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
+                    return new Dictionary<string, object?>
+                    {
+                        ["name"] = _loc.Card(card.Id.Entry),
+                        ["cost"] = card.EnergyCost?.GetResolved() ?? 0,
+                        ["type"] = card.Type.ToString(),
+                        ["description"] = _loc.Bilingual("cards", card.Id.Entry + ".description"),
+                        ["stats"] = stats.Count > 0 ? stats : null,
+                    };
                 }).ToList(),
             }).ToList();
 
@@ -918,6 +953,40 @@ public class RunSimulator
                 ["context"] = RunContext(),
                 ["bundles"] = bundles,
                 ["player"] = PlayerSummary(player),
+            };
+        }
+
+        // Check if there's a pending card reward from event (GetSelectedCardReward blocking)
+        if (_cardSelector.HasPendingReward)
+        {
+            var rewardCards = _cardSelector.PendingRewardCards!;
+            var cards = rewardCards.Select((cr, i) =>
+            {
+                var stats = new Dictionary<string, object?>();
+                try { foreach (var dv in cr.Card.DynamicVars.Values) stats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
+                return new Dictionary<string, object?>
+                {
+                    ["index"] = i,
+                    ["id"] = cr.Card.Id.ToString(),
+                    ["name"] = _loc.Card(cr.Card.Id.Entry),
+                    ["cost"] = cr.Card.EnergyCost?.GetResolved() ?? 0,
+                    ["type"] = cr.Card.Type.ToString(),
+                    ["rarity"] = cr.Card.Rarity.ToString(),
+                    ["description"] = _loc.Bilingual("cards", cr.Card.Id.Entry + ".description"),
+                    ["stats"] = stats.Count > 0 ? stats : null,
+                    ["after_upgrade"] = GetUpgradedInfo(cr.Card),
+                };
+            }).ToList();
+
+            return new Dictionary<string, object?>
+            {
+                ["type"] = "decision",
+                ["decision"] = "card_reward",
+                ["context"] = RunContext(),
+                ["cards"] = cards,
+                ["can_skip"] = true,
+                ["from_event"] = true,
+                ["player"] = PlayerSummary(_runState!.Players[0]),
             };
         }
 
@@ -1394,6 +1463,23 @@ public class RunSimulator
         var localEvent = RunManager.Instance.EventSynchronizer?.GetLocalEvent();
         _syncCtx.Pump();
 
+        // If we already chose an event option and the event didn't advance, force-finish
+        if (_eventOptionChosen && localEvent != null && !localEvent.IsFinished)
+        {
+            var currentOpts = localEvent.CurrentOptions;
+            var sameOptions = currentOpts != null && currentOpts.Count > 0 &&
+                _lastEventOptionCount > 0 && currentOpts.Count == _lastEventOptionCount;
+            if (sameOptions)
+            {
+                Log($"Event {localEvent.GetType().Name}: same options after choice, force-finishing");
+                _eventOptionChosen = false;
+                ForceToMap();
+                return MapSelectState();
+            }
+            // Options changed — event advanced to next page, show new options
+            _eventOptionChosen = false;
+        }
+
         // If event is finished, proceed to map
         if (localEvent == null || localEvent.IsFinished)
         {
@@ -1473,8 +1559,20 @@ public class RunSimulator
                         optDesc = rd;
                 }
 
-                // Extract vars from the relic that this option represents
+                // Extract vars: try event's own DynamicVars first, then relic
                 Dictionary<string, object?>? optVars = null;
+                try
+                {
+                    // Event's DynamicVars (covers Gold, HpLoss, Heal, etc.)
+                    if (localEvent.DynamicVars?.Values != null)
+                    {
+                        optVars = new Dictionary<string, object?>();
+                        foreach (var dv in localEvent.DynamicVars.Values)
+                            optVars[dv.Name] = (int)dv.BaseValue;
+                    }
+                }
+                catch { }
+                // Also try relic vars (for Neow options)
                 if (opt.TextKey != null)
                 {
                     try
@@ -1484,8 +1582,8 @@ public class RunSimulator
                         var relicModel = ModelDb.GetById<RelicModel>(new ModelId("RELIC", optionId));
                         if (relicModel != null)
                         {
+                            optVars ??= new Dictionary<string, object?>();
                             var mutable = relicModel.ToMutable();
-                            optVars = new Dictionary<string, object?>();
                             foreach (var dv in mutable.DynamicVars.Values)
                                 optVars[dv.Name] = (int)dv.BaseValue;
                         }
@@ -1510,13 +1608,22 @@ public class RunSimulator
         if (eventName["en"] == eventEntry + ".title")
             eventName = _loc.Event(eventEntry);
 
+        // Resolve event description, suppress if key not found
+        Dictionary<string, string?>? eventDesc = null;
+        if (localEvent.Description != null)
+        {
+            var d = _loc.Bilingual(localEvent.Description.LocTable, localEvent.Description.LocEntryKey);
+            if (d["en"] != null && d["en"] != localEvent.Description.LocEntryKey)
+                eventDesc = d;
+        }
+
         return new Dictionary<string, object?>
         {
             ["type"] = "decision",
             ["decision"] = "event_choice",
             ["context"] = RunContext(),
             ["event_name"] = eventName,
-            ["description"] = localEvent.Description?.LocEntryKey ?? "",
+            ["description"] = eventDesc,
             ["options"] = options,
             ["player"] = PlayerSummary(_runState!.Players[0]),
         };
@@ -1945,13 +2052,46 @@ public class RunSimulator
             _pendingTcs = null;
         }
 
+        // Pending card reward from events (GetSelectedCardReward blocks until resolved)
+        public List<MegaCrit.Sts2.Core.Entities.Cards.CardCreationResult>? PendingRewardCards { get; private set; }
+        private ManualResetEventSlim? _rewardWait;
+        private int _rewardChoice = -1;
+
         public CardModel? GetSelectedCardReward(
             IReadOnlyList<MegaCrit.Sts2.Core.Entities.Cards.CardCreationResult> options,
             IReadOnlyList<CardRewardAlternative> alternatives)
         {
-            // This is for the TestMode auto-select path (card rewards)
-            // We handle card rewards separately via card_reward decision
-            return options.Count > 0 ? options[0].Card : null;
+            if (options.Count == 0) return null;
+
+            // Store pending and block until main loop resolves
+            PendingRewardCards = options.ToList();
+            _rewardChoice = -1;
+            _rewardWait = new ManualResetEventSlim(false);
+
+            Console.Error.WriteLine($"[SIM] Card reward pending: {options.Count} cards (blocking)");
+            _rewardWait.Wait(TimeSpan.FromSeconds(300)); // Wait up to 5 min
+
+            var choice = _rewardChoice;
+            PendingRewardCards = null;
+            _rewardWait = null;
+
+            if (choice >= 0 && choice < options.Count)
+                return options[choice].Card;
+            return null;  // Skip
+        }
+
+        public bool HasPendingReward => PendingRewardCards != null && _rewardWait != null;
+
+        public void ResolveReward(int index)
+        {
+            _rewardChoice = index;
+            _rewardWait?.Set();
+        }
+
+        public void SkipReward()
+        {
+            _rewardChoice = -1;
+            _rewardWait?.Set();
         }
     }
 

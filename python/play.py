@@ -293,7 +293,8 @@ def show_player(p, show_deck=False):
             print(f"  {c(t('Deck:','牌组:'), 'bold')}")
             for cd in cards:
                 up = c("⬆", "green") if cd.get("upgraded") else ""
-                print(f"    {n(cd['name'])}{up} ({cd.get('cost','?')}) {c(cd.get('type',''), 'dim')}")
+                ctype_zh = CARD_TYPE_ZH.get(cd.get("type",""), cd.get("type",""))
+                print(f"    {n(cd['name'])}{up} ({cd.get('cost','?')}) {c(t(cd.get('type',''), ctype_zh), 'dim')}")
 
 def show_combat(state):
     rnd = state.get("round", 0)
@@ -707,6 +708,9 @@ def _render_map(map_data, choice_set=None):
     width = W * total_cols + 6
     print(f"\n{'═' * width}")
     print(f"  {c(act, 'bold')} — {t('Floor','层')} {floor_n}")
+    # Show current position if it's not on the map grid (e.g., starting row 0)
+    if cur and cur.get("row", -1) not in row_numbers:
+        print(f"  {c(t('You are at the start','你在起点'), 'green')}")
     print()
 
     # Boss row
@@ -1175,8 +1179,10 @@ def play(character="Ironclad", seed=None, auto=False):
 
                 # Save state before choice to show diff
                 old_relics = set(n(r.get("name","?")) for r in state.get("player",{}).get("relics",[]))
+                old_deck_cards = [n(cd.get("name","?")) for cd in state.get("player",{}).get("deck",[])]
                 old_deck = state.get("player",{}).get("deck_size", 0)
                 old_hp = state.get("player",{}).get("hp", 0)
+                old_max_hp = state.get("player",{}).get("max_hp", 0)
                 old_gold = state.get("player",{}).get("gold", 0)
 
                 if auto:
@@ -1197,19 +1203,34 @@ def play(character="Ironclad", seed=None, auto=False):
                     new_p = state["player"]
                     new_relics = set(n(r.get("name","?")) for r in new_p.get("relics",[]))
                     gained_relics = new_relics - old_relics
+                    new_deck_cards = [n(cd.get("name","?")) for cd in new_p.get("deck",[])]
                     new_deck = new_p.get("deck_size", 0)
                     new_hp = new_p.get("hp", 0)
+                    new_max_hp = new_p.get("max_hp", 0)
                     new_gold = new_p.get("gold", 0)
                     changes = []
                     if gained_relics:
                         changes.append(f"{t('Relic','遗物')}: {', '.join(gained_relics)}")
-                    if new_deck != old_deck:
+                    # Show specific card changes
+                    from collections import Counter
+                    old_counts = Counter(old_deck_cards)
+                    new_counts = Counter(new_deck_cards)
+                    added = new_counts - old_counts
+                    removed = old_counts - new_counts
+                    if added or removed:
+                        parts = []
+                        for card_name, cnt in removed.items():
+                            parts.append(c(f"-{card_name}" + (f"x{cnt}" if cnt > 1 else ""), "red"))
+                        for card_name, cnt in added.items():
+                            parts.append(c(f"+{card_name}" + (f"x{cnt}" if cnt > 1 else ""), "green"))
+                        changes.append(f"{t('Deck','牌组')}: {' '.join(parts)}")
+                    elif new_deck != old_deck:
                         changes.append(f"{t('Deck','牌组')}: {old_deck} → {new_deck}")
-                    if new_hp != old_hp:
-                        changes.append(f"HP: {old_hp} → {new_hp}")
+                    if new_hp != old_hp or new_max_hp != old_max_hp:
+                        changes.append(f"HP: {old_hp}/{old_max_hp} → {new_hp}/{new_max_hp}")
                     if new_gold != old_gold:
                         diff = new_gold - old_gold
-                        changes.append(f"{t('Gold','金')}: {old_gold} → {new_gold} ({'+' if diff > 0 else ''}{diff})")
+                        changes.append(f"{t('Gold','金')}: {'+' if diff > 0 else ''}{diff}")
                     if changes:
                         print(f"\n  {c(t('Changes:','变化:'), 'yellow')} {'; '.join(changes)}")
 
