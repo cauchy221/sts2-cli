@@ -1150,7 +1150,8 @@ public class RunSimulator
             };
         }
 
-        // Check if there's a pending card selection (upgrade, remove, transform)
+        // Check if there's a pending card selection (upgrade, remove, transform, start-of-turn powers)
+        checkCardSelect:
         if (_cardSelector.HasPending && _cardSelector.PendingOptions != null)
         {
             var opts = _cardSelector.PendingOptions.Select((card, i) =>
@@ -1209,6 +1210,13 @@ public class RunSimulator
             // With Task.Yield() patched, combat init should be synchronous
             _syncCtx.Pump();
             WaitForActionExecutor();
+
+            // Re-check for pending card selections AFTER pump (BUG-024: start-of-turn effects
+            // like Tools of Trade create card selections during Pump, AFTER the initial HasPending check)
+            if (_cardSelector.HasPending && _cardSelector.PendingOptions != null)
+            {
+                goto checkCardSelect;  // Jump back to card_select handling
+            }
 
             if (CombatManager.Instance.IsInProgress && CombatManager.Instance.IsPlayPhase)
             {
@@ -2087,8 +2095,8 @@ public class RunSimulator
                     ["target_type"] = p.TargetType.ToString(),
                 };
             }).Where(x => x != null).ToList(),
-            ["deck_size"] = player.Deck?.Cards?.Count ?? 0,
-            ["deck"] = player.Deck?.Cards?.Select(c =>
+            ["deck_size"] = player.Deck?.Cards?.Count(c => c != null) ?? 0,
+            ["deck"] = player.Deck?.Cards?.Where(c => c != null).Select(c =>
             {
                 var dstats = new Dictionary<string, object?>();
                 try { foreach (var dv in c.DynamicVars.Values) dstats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
