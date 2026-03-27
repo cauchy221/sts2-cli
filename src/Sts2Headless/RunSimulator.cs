@@ -674,10 +674,10 @@ public class RunSimulator
         // Wait for play phase to resume or combat to end.
         // The game DLL processes enemy actions, poison ticks, start-of-turn effects
         // asynchronously. We must pump the sync context until the play phase resumes.
-        // Increased from 500×2ms to 2000×2ms (4 seconds) to handle complex
+        // Increased from 500×2ms to 3000×2ms (6 seconds) to handle complex
         // enemy turns (multi-enemy, many powers/effects).
         bool turnResolved = false;
-        for (int i = 0; i < 2000; i++)
+        for (int i = 0; i < 3000; i++)
         {
             _syncCtx.Pump();
             if (_turnStarted.IsSet || _combatEnded.IsSet) { turnResolved = true; break; }
@@ -688,9 +688,24 @@ public class RunSimulator
 
         if (!turnResolved)
         {
-            Log($"DoEndTurn: turn did not resolve after 4s pump. " +
+            Log($"DoEndTurn: turn did not resolve after 6s pump. " +
                 $"IsPlayPhase={CombatManager.Instance.IsPlayPhase}, IsInProgress={CombatManager.Instance.IsInProgress}");
-            throw new TimeoutException("EndTurn: turn transition did not complete after 4s");
+            throw new TimeoutException("EndTurn: turn transition did not complete after 6s");
+        }
+
+        // Post-resolution pump: even after IsPlayPhase becomes true, the game
+        // may still be drawing cards and restoring energy asynchronously.
+        // Pump until the hand is non-empty or combat ended (up to 1 second).
+        var pcs = player.PlayerCombatState;
+        if (pcs != null && CombatManager.Instance.IsInProgress && CombatManager.Instance.IsPlayPhase)
+        {
+            for (int i = 0; i < 500; i++)
+            {
+                _syncCtx.Pump();
+                if (pcs.Hand.Cards.Count > 0) break;
+                if (!CombatManager.Instance.IsInProgress) break;
+                Thread.Sleep(2);
+            }
         }
 
         return DetectDecisionPoint();
@@ -1367,7 +1382,7 @@ public class RunSimulator
             // Previous 100ms wait was too short — caused stuck end_turn loops
             // where DetectDecisionPoint returned CombatPlayState with IsPlayPhase=false,
             // and the agent called end_turn again in an infinite loop.
-            for (int i = 0; i < 1000; i++)
+            for (int i = 0; i < 2000; i++)
             {
                 _syncCtx.Pump();
                 if (CombatManager.Instance.IsPlayPhase) return CombatPlayState(player);
