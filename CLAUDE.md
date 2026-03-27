@@ -23,8 +23,14 @@ Expected: `Completed: 5/5` for every character.
 ## Build
 
 ```bash
+# Debug (for development)
 ~/.dotnet-arm64/dotnet build src/Sts2Headless/Sts2Headless.csproj
+
+# Release (for training — game_client prefers Release)
+~/.dotnet-arm64/dotnet build src/Sts2Headless/Sts2Headless.csproj -c Release
 ```
+
+Always build Release after changes — the Python `game_client.py` prefers `bin/Release/` over `bin/Debug/`.
 
 ## Key Architecture
 

@@ -49,14 +49,18 @@ internal class InlineSynchronizationContext : SynchronizationContext
             _queue.Enqueue((d, state));
             return;
         }
-        // removed debug log
+
+        // Ensure this sync context is set on the current thread.
+        // Fire-and-forget async chains (TaskHelper.RunSafely) may post
+        // callbacks from ThreadPool threads. Those threads need our sync
+        // context so that subsequent await continuations also post here.
+        SynchronizationContext.SetSynchronizationContext(this);
 
         // Execute inline immediately, then drain any nested posts
         _executing = true;
         try
         {
             d(state);
-            // Drain any callbacks that were queued during execution
             while (_queue.Count > 0)
             {
                 var (cb, st) = _queue.Dequeue();
@@ -71,13 +75,13 @@ internal class InlineSynchronizationContext : SynchronizationContext
 
     public override void Send(SendOrPostCallback d, object? state)
     {
+        SynchronizationContext.SetSynchronizationContext(this);
         d(state);
     }
 
     public void Pump(int maxIterations = 10000)
     {
-        // Drain any remaining queued callbacks with an iteration cap
-        // to prevent infinite loops from recursive callback chains
+        SynchronizationContext.SetSynchronizationContext(this);
         int count = 0;
         while (_queue.Count > 0 && count++ < maxIterations)
         {
@@ -645,82 +649,78 @@ public class RunSimulator
 
     private Dictionary<string, object?> DoEndTurn(Player player)
     {
+        // Defensive: clear stale flags from a previous failed transition.
+        // CombatManager.Reset() does NOT reset these (decompiled code confirms).
+        if (CombatManager.Instance.EndingPlayerTurnPhaseTwo)
+        {
+            typeof(CombatManager).GetProperty("EndingPlayerTurnPhaseTwo")
+                ?.SetValue(CombatManager.Instance, false);
+        }
+        if (CombatManager.Instance.EndingPlayerTurnPhaseOne)
+        {
+            typeof(CombatManager).GetProperty("EndingPlayerTurnPhaseOne")
+                ?.SetValue(CombatManager.Instance, false);
+        }
+
         if (!CombatManager.Instance.IsPlayPhase)
         {
-            // Not in play phase — wait for it (up to 3 seconds).
-            // Previously waited only 100ms then returned DetectDecisionPoint, which
-            // returned CombatPlayState even though IsPlayPhase was false — causing
-            // an infinite stuck loop (78% of training episodes).
+            // Wait briefly — a previous transition may still be finishing.
             bool gotPlayPhase = false;
-            for (int i = 0; i < 1500; i++)
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < 3000)
             {
+                Thread.Sleep(10);
                 _syncCtx.Pump();
                 if (CombatManager.Instance.IsPlayPhase) { gotPlayPhase = true; break; }
                 if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead)
                     return DetectDecisionPoint();
-                Thread.Sleep(2);
             }
             if (!gotPlayPhase)
-            {
-                Log("DoEndTurn: not in play phase after 3s wait");
                 throw new TimeoutException("EndTurn: not in play phase after 3s wait");
-            }
         }
 
-        // Brief wait for any pending actions — short timeout since EndTurn has its own
         WaitForActionExecutor(1000);
-
         _turnStarted.Reset();
         _combatEnded.Reset();
 
+        // PlayerCmd.EndTurn → SetReadyToEndTurn → our Harmony prefix runs the
+        // entire turn transition synchronously (pump-until-done). By the time
+        // this call returns, the full cycle (player end → enemy turn → player
+        // start) is complete and IsPlayPhase should be true.
         PlayerCmd.EndTurn(player, canBackOut: false);
-        _syncCtx.Pump();
-        WaitForActionExecutor(3000);
 
-        // Wait for play phase to resume or combat to end.
-        // The game DLL processes enemy actions, poison ticks, start-of-turn effects
-        // asynchronously. We must pump the sync context until the play phase resumes.
-        // Increased from 500×2ms to 3000×2ms (6 seconds) to handle complex
-        // enemy turns (multi-enemy, many powers/effects).
-        bool turnResolved = false;
-        for (int i = 0; i < 3000; i++)
+        // Defensive fallback: if the prefix couldn't complete (e.g., reflection
+        // failed), pump briefly to let any remaining async work finish.
+        if (!CombatManager.Instance.IsPlayPhase && CombatManager.Instance.IsInProgress)
         {
-            _syncCtx.Pump();
-            if (_turnStarted.IsSet || _combatEnded.IsSet) { turnResolved = true; break; }
-            if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) { turnResolved = true; break; }
-            if (CombatManager.Instance.IsPlayPhase) { turnResolved = true; break; }
-            Thread.Sleep(2);
-        }
-
-        if (!turnResolved)
-        {
-            Log($"DoEndTurn: turn did not resolve after 6s pump. " +
-                $"IsPlayPhase={CombatManager.Instance.IsPlayPhase}, IsInProgress={CombatManager.Instance.IsInProgress}");
-            throw new TimeoutException("EndTurn: turn transition did not complete after 6s");
-        }
-
-        // Post-resolution: the turn-start sequence (restore energy, draw cards,
-        // trigger start-of-turn effects) runs as queued actions in the ActionExecutor.
-        // We must wait for the executor to finish AND verify cards/energy are ready.
-        var pcs = player.PlayerCombatState;
-        if (pcs != null && CombatManager.Instance.IsInProgress)
-        {
-            // First: let the ActionExecutor process all turn-start actions
-            WaitForActionExecutor(3000);
-            _syncCtx.Pump();
-
-            // Second: verify the turn-start actually completed (cards drawn, energy restored)
-            if (CombatManager.Instance.IsPlayPhase && pcs.Hand.Cards.Count == 0)
+            var sw2 = System.Diagnostics.Stopwatch.StartNew();
+            while (sw2.ElapsedMilliseconds < 5000)
             {
-                // Cards not drawn yet — pump more aggressively
-                for (int i = 0; i < 1000; i++)
-                {
-                    _syncCtx.Pump();
-                    WaitForActionExecutor(100);
-                    if (pcs.Hand.Cards.Count > 0) break;
-                    if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
-                    Thread.Sleep(2);
-                }
+                _syncCtx.Pump();
+                if (_turnStarted.IsSet || _combatEnded.IsSet) break;
+                if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
+                if (CombatManager.Instance.IsPlayPhase) break;
+                Thread.Sleep(1);
+            }
+
+            if (!CombatManager.Instance.IsPlayPhase && CombatManager.Instance.IsInProgress
+                && !player.Creature.IsDead && !_combatEnded.IsSet)
+            {
+                throw new TimeoutException("EndTurn: turn transition did not complete");
+            }
+        }
+
+        // Post-resolution: pump until cards are drawn and energy restored.
+        var pcs = player.PlayerCombatState;
+        if (pcs != null && CombatManager.Instance.IsInProgress && CombatManager.Instance.IsPlayPhase)
+        {
+            var sw3 = System.Diagnostics.Stopwatch.StartNew();
+            while (sw3.ElapsedMilliseconds < 2000)
+            {
+                _syncCtx.Pump();
+                if (pcs.Hand.Cards.Count > 0 && pcs.Energy > 0) break;
+                if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
+                Thread.Sleep(1);
             }
         }
 
@@ -1398,15 +1398,15 @@ public class RunSimulator
             // Previous 100ms wait was too short — caused stuck end_turn loops
             // where DetectDecisionPoint returned CombatPlayState with IsPlayPhase=false,
             // and the agent called end_turn again in an infinite loop.
-            for (int i = 0; i < 2000; i++)
+            for (int i = 0; i < 300; i++)
             {
+                Thread.Sleep(10);
                 _syncCtx.Pump();
                 if (CombatManager.Instance.IsPlayPhase) return CombatPlayState(player);
                 if (!CombatManager.Instance.IsInProgress || (player.Creature != null && player.Creature.IsDead))
                     return DetectPostCombatState(player, combatRoom);
                 if (_turnStarted.IsSet) return CombatPlayState(player);
                 if (_combatEnded.IsSet) return DetectPostCombatState(player, combatRoom);
-                Thread.Sleep(2);
             }
             // After 2 seconds of pumping, if still stuck, the game DLL has
             // an async operation that won't complete via pumping alone.
@@ -2188,83 +2188,47 @@ public class RunSimulator
 
     #region Helpers
 
-    private void WaitForActionExecutor(int maxWaitMs = 3000)
+    private void WaitForActionExecutor(int maxWaitMs = 5000)
     {
+        SynchronizationContext.SetSynchronizationContext(_syncCtx);
+        _syncCtx.Pump();
+
+        var executor = RunManager.Instance.ActionExecutor;
+        if (!executor.IsRunning) return;
+
+        // If a card selector is pending, the executor can't complete until
+        // the user resolves the selection. Exit early.
+        if (_cardSelector.HasPending || _cardSelector.HasPendingReward)
+            return;
+
+        // Pump sync context while the executor processes the action.
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (executor.IsRunning && sw.ElapsedMilliseconds < maxWaitMs)
+        {
+            _syncCtx.Pump();
+            if (!executor.IsRunning) break;
+            if (_cardSelector.HasPending || _cardSelector.HasPendingReward) return;
+            Thread.Sleep(1);
+        }
+
+        if (!executor.IsRunning) return;
+
+        // Still running after timeout. The action is stuck — likely an async
+        // continuation was lost (same class of bug as the EndTurn deadlock).
+        // Force combat loss for clean episode termination rather than leaving
+        // the engine in a broken state.
+        Log($"WaitForActionExecutor: stuck after {maxWaitMs}ms, forcing combat loss");
         try
         {
-            // Ensure sync context is set for this thread
-            SynchronizationContext.SetSynchronizationContext(_syncCtx);
-
-            // Pump the synchronization context to execute any pending continuations
+            executor.Cancel();
             _syncCtx.Pump();
-
-            var executor = RunManager.Instance.ActionExecutor;
-            if (executor.IsRunning)
-            {
-                // BUG-026: If a card selector is pending (e.g., Attack Potion chose-a-card),
-                // the executor can't complete until the user resolves the selection.
-                // Exit early so the caller can detect the pending state and return card_select.
-                if (_cardSelector.HasPending || _cardSelector.HasPendingReward)
-                    return;
-
-                // Pump while waiting for executor with configurable timeout
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                while (executor.IsRunning && sw.ElapsedMilliseconds < maxWaitMs)
-                {
-                    _syncCtx.Pump();
-                    if (!executor.IsRunning) break;
-                    // Also check if a card selector became pending during pump
-                    if (_cardSelector.HasPending || _cardSelector.HasPendingReward) return;
-                    Thread.Sleep(1);
-                }
-
-                if (executor.IsRunning)
-                {
-                    Log($"WaitForActionExecutor: still running after {maxWaitMs}ms, " +
-                        $"attempting cancel (IsPlayPhase={CombatManager.Instance.IsPlayPhase})");
-                    try
-                    {
-                        // Force SuppressYield and pump aggressively
-                        
-                        for (int i = 0; i < 200; i++)
-                        {
-                            _syncCtx.Pump();
-                            if (!executor.IsRunning) break;
-                            Thread.Sleep(5);
-                        }
-                        
-
-                        // If STILL running, cancel the executor
-                        if (executor.IsRunning)
-                        {
-                            Log("WaitForActionExecutor: forcing cancel");
-                            executor.Cancel();
-                            _syncCtx.Pump();
-                            Thread.Sleep(50);
-                            _syncCtx.Pump();
-                        }
-
-                        // If STILL running after cancel, throw so caller returns error
-                        // instead of proceeding to DetectDecisionPoint on corrupt state
-                        if (executor.IsRunning)
-                        {
-                            throw new TimeoutException(
-                                $"ActionExecutor stuck after {maxWaitMs}ms + cancel. " +
-                                $"IsPlayPhase={CombatManager.Instance.IsPlayPhase}");
-                        }
-                    }
-                    catch (TimeoutException) { throw; } // Don't swallow our own timeout
-                    catch (Exception ex)
-                    {
-                        Log($"WaitForActionExecutor cancel: {ex.Message}");
-                    }
-                }
-            }
+            if (CombatManager.Instance.IsInProgress)
+                CombatManager.Instance.LoseCombat();
+            _syncCtx.Pump();
         }
-        catch (TimeoutException) { throw; } // Propagate to caller
         catch (Exception ex)
         {
-            Log($"WaitForActionExecutor exception: {ex.Message}");
+            Log($"WaitForActionExecutor recovery: {ex.Message}");
         }
     }
 
@@ -2489,6 +2453,41 @@ public class RunSimulator
         // causing deadlocks on end_turn after round 5+ in various combat encounters.
         PatchGodotTimerMethods();
 
+        // Patch TaskHelper.RunSafely to ensure our sync context is set on ALL
+        // threads that run fire-and-forget async game code. Without this,
+        // async state machines launched via TaskHelper.RunSafely (like
+        // AfterAllPlayersReadyToBeginEnemyTurn) may run on ThreadPool threads
+        // without our sync context, causing their await continuations to never
+        // be pumped — leading to EndingPhaseTwo=True stuck states.
+        PatchTaskHelperRunSafely();
+
+        // Patch PlayerHurtVignetteHelper.Play — calls NLowHpBorderVfx.Create()
+        // which throws because Godot UI nodes don't exist in headless mode.
+        try
+        {
+            var vfxHelperType = typeof(MegaCrit.Sts2.Core.Commands.CardPileCmd).Assembly
+                .GetType("MegaCrit.Sts2.Core.Nodes.Vfx.PlayerHurtVignetteHelper");
+            if (vfxHelperType != null)
+            {
+                var playMethod = vfxHelperType.GetMethod("Play",
+                    System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
+                if (playMethod != null)
+                {
+                    var h = new Harmony("sts2headless.vfxskip");
+                    h.Patch(playMethod, new HarmonyMethod(typeof(YieldPatches).GetMethod(
+                        nameof(YieldPatches.SkipPrefix),
+                        System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public)));
+                    Console.Error.WriteLine("[INFO] Patched PlayerHurtVignetteHelper.Play → skip (no Godot UI)");
+                }
+            }
+        }
+        catch (Exception ex) { Console.Error.WriteLine($"[WARN] Failed to patch PlayerHurtVignetteHelper: {ex.Message}"); }
+
+        // ROOT CAUSE FIX: Replace fire-and-forget turn transitions with synchronous
+        // pump-until-done. Prevents async continuations from being lost when
+        // DoEndTurn's pump loop exits early on enemy TurnStarted event.
+        PatchTurnTransition();
+
         // Initialize localization system (needed for events, cards, etc.)
         InitLocManager();
 
@@ -2669,6 +2668,92 @@ public class RunSimulator
         }
     }
 
+    private static void PatchTaskHelperRunSafely()
+    {
+        // Patch multiple game methods that launch fire-and-forget async chains.
+        // These methods call TaskHelper.RunSafely() which creates async tasks whose
+        // continuations must post to our sync context. If the launching thread
+        // doesn't have our sync context, continuations go to ThreadPool and never
+        // get pumped — causing EndingPhaseTwo=True stuck states.
+        try
+        {
+            var harmony = new Harmony("sts2headless.syncctx");
+
+            var prefix = typeof(RunSimulator).GetMethod(nameof(EnsureSyncContextPrefix),
+                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+
+            // Patch CombatManager.SetReadyToEndTurn — launches AfterAllPlayersReadyToEndTurn
+            PatchMethod(harmony, typeof(CombatManager), "SetReadyToEndTurn", "SetReadyToEndTurn");
+
+            // Patch CombatManager.SetReadyToBeginEnemyTurn — launches AfterAllPlayersReadyToBeginEnemyTurn
+            PatchMethod(harmony, typeof(CombatManager), "SetReadyToBeginEnemyTurn", "SetReadyToBeginEnemyTurn");
+
+            // Patch ActionExecutor.ActionQueueChanged — launches ExecuteActions
+            var aqcMethod = typeof(MegaCrit.Sts2.Core.GameActions.ActionExecutor).GetMethod("ActionQueueChanged",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (aqcMethod != null)
+            {
+                harmony.Patch(aqcMethod, new HarmonyMethod(prefix));
+                Console.Error.WriteLine("[INFO] Patched ActionExecutor.ActionQueueChanged → ensures sync context");
+            }
+
+            // Also patch TaskHelper.RunSafely itself as a catch-all
+            var runSafely = typeof(MegaCrit.Sts2.Core.Helpers.TaskHelper).GetMethod("RunSafely",
+                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
+            if (runSafely != null)
+            {
+                harmony.Patch(runSafely, new HarmonyMethod(prefix));
+                Console.Error.WriteLine("[INFO] Patched TaskHelper.RunSafely → ensures sync context");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] PatchTaskHelperRunSafely failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Harmony prefix: ensure our InlineSynchronizationContext is set on the
+    /// current thread before any fire-and-forget async work starts.
+    /// </summary>
+    private static bool EnsureSyncContextPrefix()
+    {
+        SynchronizationContext.SetSynchronizationContext(_syncCtx);
+        return true;
+    }
+
+    private static void PatchTurnTransition()
+    {
+        try
+        {
+            var harmony = new Harmony("sts2headless.turntransition");
+            var bindFlags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public;
+            var staticFlags = System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public;
+
+            // ROOT CAUSE FIX: Replace SetReadyToEndTurn's fire-and-forget turn transition
+            // with synchronous pump-until-done. The original fires the entire turn cycle
+            // (player end → enemy turn → player start) as an unobserved async chain.
+            // In headless mode, DoEndTurn's pump loop can exit early (on enemy TurnStarted
+            // event), abandoning async continuations that never get pumped again.
+            var method = typeof(CombatManager).GetMethod("SetReadyToEndTurn", bindFlags);
+            if (method != null)
+            {
+                harmony.Patch(method,
+                    prefix: new HarmonyMethod(typeof(TurnTransitionPatches).GetMethod(
+                        nameof(TurnTransitionPatches.SetReadyToEndTurnPrefix), staticFlags)));
+                Console.Error.WriteLine("[INFO] Patched SetReadyToEndTurn → synchronous turn transition");
+            }
+            else
+            {
+                Console.Error.WriteLine("[WARN] Could not find SetReadyToEndTurn — turn transition fix NOT applied");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] PatchTurnTransition failed: {ex.Message}");
+        }
+    }
+
     private static void PatchTaskYield()
     {
         try
@@ -2811,20 +2896,170 @@ public class RunSimulator
         }
     }
 
+    internal static class TurnTransitionPatches
+    {
+        private static readonly System.Reflection.BindingFlags AnyInstance =
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public;
+
+        // Cache reflection lookups (resolved once, reused every turn)
+        private static System.Reflection.FieldInfo? _readySetField;
+        private static System.Reflection.FieldInfo? _playerEndedTurnField;
+        private static System.Reflection.MethodInfo? _allReadyMethod;
+        private static System.Reflection.MethodInfo? _waitForActionMethod;
+        private static System.Reflection.MethodInfo? _afterAllReadyMethod;
+        private static bool _reflectionResolved;
+
+        private static void ResolveReflection()
+        {
+            if (_reflectionResolved) return;
+            _reflectionResolved = true;
+
+            _readySetField = typeof(CombatManager).GetField("_playersReadyToEndTurn", AnyInstance);
+            _playerEndedTurnField = typeof(CombatManager).GetField("PlayerEndedTurn", AnyInstance);
+            _allReadyMethod = typeof(CombatManager).GetMethod("AllPlayersReadyToEndTurn", AnyInstance);
+            _waitForActionMethod = typeof(CombatManager).GetMethod("WaitForActionThenEndTurn", AnyInstance);
+            _afterAllReadyMethod = typeof(CombatManager).GetMethod("AfterAllPlayersReadyToEndTurn", AnyInstance);
+
+            // Warn about any missing fields/methods so game version mismatches are visible
+            if (_readySetField == null) Console.Error.WriteLine("[WARN] Reflection: _playersReadyToEndTurn not found");
+            if (_allReadyMethod == null) Console.Error.WriteLine("[WARN] Reflection: AllPlayersReadyToEndTurn not found");
+            if (_afterAllReadyMethod == null) Console.Error.WriteLine("[WARN] Reflection: AfterAllPlayersReadyToEndTurn not found");
+        }
+
+        /// <summary>
+        /// Harmony prefix for SetReadyToEndTurn — ROOT CAUSE FIX.
+        ///
+        /// The game fires turn transitions as fire-and-forget async chains via
+        /// TaskHelper.RunSafely(). In headless mode, DoEndTurn drives these chains
+        /// by pumping our InlineSynchronizationContext. But the pump loop exits
+        /// prematurely when the TurnStarted event fires on the ENEMY turn start
+        /// (before IsPlayPhase=true). After that, nobody pumps the remaining
+        /// continuations (enemy actions, hooks, player turn setup), so they are
+        /// permanently lost — not in the sync context, not in the ThreadPool.
+        ///
+        /// Fix: intercept SetReadyToEndTurn, invoke the turn transition directly,
+        /// and pump the sync context in a tight loop until the Task completes.
+        /// This guarantees the full cycle (player end → enemy turn → player start)
+        /// finishes before control returns to DoEndTurn.
+        /// </summary>
+        public static bool SetReadyToEndTurnPrefix(CombatManager __instance, Player player, bool canBackOut, Func<Task>? actionDuringEnemyTurn)
+        {
+            if (!__instance.IsInProgress)
+                return false;
+
+            ResolveReflection();
+
+            // Replicate original: add player to ready set
+            if (_readySetField?.GetValue(__instance) is HashSet<Player> set)
+                set.Add(player);
+
+            // Fire PlayerEndedTurn event
+            if (_playerEndedTurnField?.GetValue(__instance) is Action<Player, bool> handler)
+                handler(player, canBackOut);
+
+            // Check if all players ready (single-player: always true after one player)
+            bool allReady = (bool)(_allReadyMethod?.Invoke(__instance, null) ?? false);
+            if (!allReady)
+                return false;
+
+            // Determine which async method to invoke
+            var executor = RunManager.Instance.ActionExecutor;
+            var currentAction = executor.CurrentlyRunningAction;
+
+            Task? turnTask = null;
+            try
+            {
+                if (currentAction != null && ActionQueueSet.IsGameActionPlayerDriven(currentAction))
+                {
+                    turnTask = _waitForActionMethod?.Invoke(__instance, new object?[] { currentAction, actionDuringEnemyTurn }) as Task;
+                }
+                else
+                {
+                    turnTask = _afterAllReadyMethod?.Invoke(__instance, new object?[] { actionDuringEnemyTurn }) as Task;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[WARN] Turn transition invoke failed: {ex.InnerException?.Message ?? ex.Message}");
+                return false;
+            }
+
+            if (turnTask == null)
+            {
+                Console.Error.WriteLine("[WARN] Turn transition returned null Task — skipping sync pump");
+                return false;
+            }
+
+            // Pump sync context until the entire turn cycle completes.
+            // This replaces the fire-and-forget + DoEndTurn pump loop approach.
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (!turnTask.IsCompleted && sw.ElapsedMilliseconds < 30000)
+            {
+                _syncCtx.Pump(100);
+                if (!turnTask.IsCompleted)
+                    Thread.Sleep(0);
+            }
+
+            if (turnTask.IsFaulted || !turnTask.IsCompleted)
+            {
+                // The chain either threw or timed out. The engine is in an
+                // unrecoverable state (IsPlayPhase=false, async chain dead).
+                // End combat as a loss so the episode terminates cleanly
+                // instead of spinning on no-op end_turns for 20 cycles.
+                if (turnTask.IsFaulted)
+                {
+                    var innerEx = turnTask.Exception?.Flatten()?.InnerExceptions?.FirstOrDefault();
+                    Console.Error.WriteLine($"[WARN] Turn transition faulted: {innerEx?.GetType().Name}: {innerEx?.Message} at {innerEx?.StackTrace?.Split('\n').FirstOrDefault()?.Trim()}");
+                }
+                else
+                {
+                    Console.Error.WriteLine("[WARN] Turn transition did not complete within 30s");
+                }
+
+                // Reset stuck flags
+                try
+                {
+                    if (__instance.EndingPlayerTurnPhaseOne)
+                        typeof(CombatManager).GetProperty("EndingPlayerTurnPhaseOne")?.SetValue(__instance, false);
+                    if (__instance.EndingPlayerTurnPhaseTwo)
+                        typeof(CombatManager).GetProperty("EndingPlayerTurnPhaseTwo")?.SetValue(__instance, false);
+                }
+                catch { }
+
+                // Force combat loss — cleanly ends the episode
+                try
+                {
+                    if (__instance.IsInProgress)
+                        __instance.LoseCombat();
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[WARN] LoseCombat failed: {ex.Message}");
+                }
+            }
+
+            return false; // Skip original method
+        }
+    }
+
     internal static class YieldPatches
     {
-        // Only suppress Task.Yield() when this flag is set (during end_turn processing)
         public static volatile bool SuppressYield;
+        public static volatile int YieldSuppressCount;
 
         public static bool IsCompletedPrefix(ref bool __result)
         {
             if (SuppressYield)
             {
+                Interlocked.Increment(ref YieldSuppressCount);
                 __result = true;
                 return false;
             }
-            return true; // Let normal Yield behavior run
+            return true;
         }
+
+        /// <summary>Harmony prefix: skip a void method entirely (no-op in headless).</summary>
+        public static bool SkipPrefix() => false;
 
         /// <summary>Harmony prefix: make Cmd.Wait() return completed task immediately (no-op in headless).</summary>
         public static bool CmdWaitPrefix(ref Task __result)
