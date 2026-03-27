@@ -676,13 +676,21 @@ public class RunSimulator
         // asynchronously. We must pump the sync context until the play phase resumes.
         // Increased from 500×2ms to 2000×2ms (4 seconds) to handle complex
         // enemy turns (multi-enemy, many powers/effects).
+        bool turnResolved = false;
         for (int i = 0; i < 2000; i++)
         {
             _syncCtx.Pump();
-            if (_turnStarted.IsSet || _combatEnded.IsSet) break;
-            if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
-            if (CombatManager.Instance.IsPlayPhase) break;
+            if (_turnStarted.IsSet || _combatEnded.IsSet) { turnResolved = true; break; }
+            if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) { turnResolved = true; break; }
+            if (CombatManager.Instance.IsPlayPhase) { turnResolved = true; break; }
             Thread.Sleep(2);
+        }
+
+        if (!turnResolved)
+        {
+            Log($"DoEndTurn: turn did not resolve after 4s pump. " +
+                $"IsPlayPhase={CombatManager.Instance.IsPlayPhase}, IsInProgress={CombatManager.Instance.IsInProgress}");
+            throw new TimeoutException("EndTurn: turn transition did not complete after 4s");
         }
 
         return DetectDecisionPoint();
@@ -1369,10 +1377,14 @@ public class RunSimulator
                 if (_combatEnded.IsSet) return DetectPostCombatState(player, combatRoom);
                 Thread.Sleep(2);
             }
-            // After 2 seconds of pumping, if still stuck, return combat state.
-            // This is better than before but may still happen rarely.
+            // After 2 seconds of pumping, if still stuck, the game DLL has
+            // an async operation that won't complete via pumping alone.
+            // Throw TimeoutException so the episode ends cleanly (reward=0)
+            // rather than creating a stuck end_turn loop.
             Log($"DetectDecisionPoint fallback: IsPlayPhase={CombatManager.Instance.IsPlayPhase}, IsInProgress={CombatManager.Instance.IsInProgress}");
-            return CombatPlayState(player);
+            throw new TimeoutException(
+                $"Combat stuck: IsPlayPhase={CombatManager.Instance.IsPlayPhase}, " +
+                $"IsInProgress={CombatManager.Instance.IsInProgress} after 2s pump");
         }
 
         // Event room
