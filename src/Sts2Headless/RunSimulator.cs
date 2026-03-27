@@ -672,9 +672,11 @@ public class RunSimulator
         WaitForActionExecutor(3000);
 
         // Wait for play phase to resume or combat to end.
-        // Note: the round number may not increment reliably in headless mode,
-        // but the game IS playable — cards can be played and enemies take damage.
-        for (int i = 0; i < 500; i++)
+        // The game DLL processes enemy actions, poison ticks, start-of-turn effects
+        // asynchronously. We must pump the sync context until the play phase resumes.
+        // Increased from 500×2ms to 2000×2ms (4 seconds) to handle complex
+        // enemy turns (multi-enemy, many powers/effects).
+        for (int i = 0; i < 2000; i++)
         {
             _syncCtx.Pump();
             if (_turnStarted.IsSet || _combatEnded.IsSet) break;
@@ -1351,14 +1353,25 @@ public class RunSimulator
             {
                 return DetectPostCombatState(player, combatRoom);
             }
-            // Fallback: brief wait
-            for (int i = 0; i < 20; i++)
+            // Fallback: wait for play phase or combat end.
+            // The game DLL's async turn transition (enemy actions, poison ticks,
+            // start-of-turn effects) can take many pump cycles in headless mode.
+            // Previous 100ms wait was too short — caused stuck end_turn loops
+            // where DetectDecisionPoint returned CombatPlayState with IsPlayPhase=false,
+            // and the agent called end_turn again in an infinite loop.
+            for (int i = 0; i < 1000; i++)
             {
                 _syncCtx.Pump();
-                Thread.Sleep(5);
                 if (CombatManager.Instance.IsPlayPhase) return CombatPlayState(player);
-                if (!CombatManager.Instance.IsInProgress) return DetectPostCombatState(player, combatRoom);
+                if (!CombatManager.Instance.IsInProgress || (player.Creature != null && player.Creature.IsDead))
+                    return DetectPostCombatState(player, combatRoom);
+                if (_turnStarted.IsSet) return CombatPlayState(player);
+                if (_combatEnded.IsSet) return DetectPostCombatState(player, combatRoom);
+                Thread.Sleep(2);
             }
+            // After 2 seconds of pumping, if still stuck, return combat state.
+            // This is better than before but may still happen rarely.
+            Log($"DetectDecisionPoint fallback: IsPlayPhase={CombatManager.Instance.IsPlayPhase}, IsInProgress={CombatManager.Instance.IsInProgress}");
             return CombatPlayState(player);
         }
 
