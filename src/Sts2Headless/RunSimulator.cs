@@ -647,17 +647,23 @@ public class RunSimulator
     {
         if (!CombatManager.Instance.IsPlayPhase)
         {
-            // Might be between phases — pump and check
-            _syncCtx.Pump();
-            if (!CombatManager.Instance.IsPlayPhase)
+            // Not in play phase — wait for it (up to 3 seconds).
+            // Previously waited only 100ms then returned DetectDecisionPoint, which
+            // returned CombatPlayState even though IsPlayPhase was false — causing
+            // an infinite stuck loop (78% of training episodes).
+            bool gotPlayPhase = false;
+            for (int i = 0; i < 1500; i++)
             {
+                _syncCtx.Pump();
+                if (CombatManager.Instance.IsPlayPhase) { gotPlayPhase = true; break; }
                 if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead)
                     return DetectDecisionPoint();
-                // Brief wait for ThreadPool if sync context didn't catch it
-                Thread.Sleep(100);
-                _syncCtx.Pump();
-                if (!CombatManager.Instance.IsPlayPhase)
-                    return DetectDecisionPoint();
+                Thread.Sleep(2);
+            }
+            if (!gotPlayPhase)
+            {
+                Log("DoEndTurn: not in play phase after 3s wait");
+                throw new TimeoutException("EndTurn: not in play phase after 3s wait");
             }
         }
 
@@ -693,18 +699,28 @@ public class RunSimulator
             throw new TimeoutException("EndTurn: turn transition did not complete after 6s");
         }
 
-        // Post-resolution pump: even after IsPlayPhase becomes true, the game
-        // may still be drawing cards and restoring energy asynchronously.
-        // Pump until the hand is non-empty or combat ended (up to 1 second).
+        // Post-resolution: the turn-start sequence (restore energy, draw cards,
+        // trigger start-of-turn effects) runs as queued actions in the ActionExecutor.
+        // We must wait for the executor to finish AND verify cards/energy are ready.
         var pcs = player.PlayerCombatState;
-        if (pcs != null && CombatManager.Instance.IsInProgress && CombatManager.Instance.IsPlayPhase)
+        if (pcs != null && CombatManager.Instance.IsInProgress)
         {
-            for (int i = 0; i < 500; i++)
+            // First: let the ActionExecutor process all turn-start actions
+            WaitForActionExecutor(3000);
+            _syncCtx.Pump();
+
+            // Second: verify the turn-start actually completed (cards drawn, energy restored)
+            if (CombatManager.Instance.IsPlayPhase && pcs.Hand.Cards.Count == 0)
             {
-                _syncCtx.Pump();
-                if (pcs.Hand.Cards.Count > 0) break;
-                if (!CombatManager.Instance.IsInProgress) break;
-                Thread.Sleep(2);
+                // Cards not drawn yet — pump more aggressively
+                for (int i = 0; i < 1000; i++)
+                {
+                    _syncCtx.Pump();
+                    WaitForActionExecutor(100);
+                    if (pcs.Hand.Cards.Count > 0) break;
+                    if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
+                    Thread.Sleep(2);
+                }
             }
         }
 
